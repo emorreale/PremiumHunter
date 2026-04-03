@@ -2,3 +2,5 @@ pyetrade==2.1.1
 streamlit==1.56.0
 pandas==3.0.2
 python-dotenv==1.2.2
+yfinance==1.2.0
+plotly==6.6.0

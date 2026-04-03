@@ -5,9 +5,6 @@ import sys
 _STREAMLIT_CHILD = "PREMIUMHUNTER_STREAMLIT_CHILD"
 
 if __name__ == "__main__":
-    # Hand off to Streamlit only for `python app.py`. Skip when Streamlit is already
-    # running this file (`streamlit run` or our subprocess child) so we never call
-    # Streamlit APIs without a ScriptRunContext (avoids the "bare mode" warning).
     _already_streamlit = "streamlit" in sys.modules
     _our_child = os.environ.get(_STREAMLIT_CHILD) == "1"
     if not _already_streamlit and not _our_child:
@@ -27,24 +24,197 @@ if __name__ == "__main__":
         )
         raise SystemExit(rc)
 
-import datetime as dt
-
 import streamlit as st
 
 from etrade_auth import (
+    IS_SANDBOX,
     clear_persisted_tokens,
     get_access_tokens,
     get_oauth,
     load_persisted_tokens,
     save_persisted_tokens,
 )
-from etrade_market import create_market_session, get_expiry_dates, get_option_chain, get_quote
+from etrade_market import create_market_session
 
 
 st.set_page_config(page_title="PremiumHunter", page_icon="🎯", layout="wide")
 
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500;700&display=swap');
+
+/* ── Base ────────────────────────────────────────────────────── */
+.stApp {
+    background-color: #0e1117;
+    font-family: 'Inter', sans-serif;
+}
+html, body, [class*="st-"] {
+    font-family: 'Inter', sans-serif !important;
+}
+code, .stDataFrame td, .stDataFrame th,
+.stMetric [data-testid="stMetricValue"] {
+    font-family: 'Roboto Mono', monospace !important;
+}
+
+/* ── Glassmorphism cards ─────────────────────────────────────── */
+.glass-card {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 4px 30px rgba(0,0,0,0.5);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+}
+
+/* ── Hero score with gradient glow ───────────────────────────── */
+.hero-score {
+    font-family: 'Roboto Mono', monospace;
+    font-size: 4rem;
+    font-weight: 800;
+    background: linear-gradient(45deg, #00ff88, #00bdff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-align: center;
+    line-height: 1;
+}
+.hero-score-red {
+    font-family: 'Roboto Mono', monospace;
+    font-size: 4rem;
+    font-weight: 800;
+    background: linear-gradient(45deg, #ff5252, #ff9800);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-align: center;
+    line-height: 1;
+}
+.hero-score-yellow {
+    font-family: 'Roboto Mono', monospace;
+    font-size: 4rem;
+    font-weight: 800;
+    background: linear-gradient(45deg, #ffc107, #ff9800);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-align: center;
+    line-height: 1;
+}
+
+/* ── Badge pills ─────────────────────────────────────────────── */
+.badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    margin-left: 6px;
+    vertical-align: middle;
+}
+.badge-green  { background: rgba(0,255,136,0.12); color: #00ff88; }
+.badge-yellow { background: rgba(255,193,7,0.15); color: #ffc107; }
+.badge-red    { background: rgba(255,82,82,0.15); color: #ff5252; }
+.badge-blue   { background: rgba(0,189,255,0.12); color: #00bdff; }
+
+/* yield pill (used in option chain rows) */
+.yield-pill {
+    display: inline-block;
+    padding: 3px 12px;
+    border-radius: 999px;
+    font-family: 'Roboto Mono', monospace;
+    font-size: 0.82rem;
+    font-weight: 600;
+}
+
+/* ── Data table overrides ────────────────────────────────────── */
+table {
+    border-collapse: separate !important;
+    border-spacing: 0 8px !important;
+    background-color: transparent !important;
+}
+thead th {
+    background-color: #1a1c23 !important;
+    color: #94a3b8 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.75rem;
+    border: none !important;
+}
+tbody tr {
+    background-color: #161b22 !important;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+tbody tr:hover {
+    transform: scale(1.01);
+    background-color: #21262d !important;
+    box-shadow: 0 0 15px rgba(0,255,136,0.1);
+}
+
+/* ── Streamlit widget polish ─────────────────────────────────── */
+.stDataFrame { border-radius: 10px; overflow: hidden; }
+div[data-testid="stMetric"] {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+    padding: 0.8rem 1rem;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+}
+div[data-testid="stExpander"] {
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+}
+
+/* ── Sticky header ───────────────────────────────────────────── */
+.sticky-header {
+    position: sticky;
+    top: 0;
+    z-index: 999;
+    background: rgba(14,17,23,0.92);
+    backdrop-filter: blur(10px);
+    padding: 8px 0;
+    margin: -1rem -1rem 0.5rem -1rem;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+/* ── Strike row cards ────────────────────────────────────────── */
+.strike-row {
+    background: #161b22;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 10px;
+    padding: 0.65rem 1rem;
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.strike-row:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 0 18px rgba(0,255,136,0.08);
+    border-color: rgba(0,255,136,0.2);
+}
+
+/* ── Label helpers ───────────────────────────────────────────── */
+.section-label {
+    font-size: 0.7rem;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+}
+.dim { color: #555; }
+.mono { font-family: 'Roboto Mono', monospace; }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("🎯 Premium Hunter")
 st.caption("Hunt for the best option premiums — Cash Secured Puts & Covered Calls")
+if IS_SANDBOX:
+    st.warning(
+        "**Sandbox mode** — The E*Trade sandbox returns static sample data (GOOG from 2012) "
+        "for all tickers. Prices, expirations, and option chains will not reflect real market data. "
+        "To use live data, request **production API keys** from E*Trade and set "
+        "`ETRADE_SANDBOX=False` in your `.env` file."
+    )
 
 # ── Authentication ──────────────────────────────────────────────────────────────
 
@@ -100,112 +270,10 @@ with st.sidebar:
             st.session_state._disk_tokens_tried = True
             st.rerun()
 
-# ── Main Content ────────────────────────────────────────────────────────────────
+# ── Page navigation ─────────────────────────────────────────────────────────────
 
-if st.session_state.market is None:
-    st.info("Connect to E-Trade using the sidebar to get started.")
-    st.stop()
+discover_page = st.Page("pages/1_Discover.py", title="Discover", icon="🔍", default=True)
+watchlist_page = st.Page("pages/2_Watchlist.py", title="Watchlist", icon="⭐")
 
-market = st.session_state.market
-
-col1, col2 = st.columns([1, 3])
-
-with col1:
-    ticker = st.text_input("Ticker Symbol", value="AAPL", max_chars=10).upper().strip()
-
-if not ticker:
-    st.warning("Enter a ticker symbol.")
-    st.stop()
-
-# Fetch underlying quote
-try:
-    quote = get_quote(market, ticker)
-    all_data = quote.get("All", {})
-    last_price = all_data.get("lastTrade", "N/A")
-    with col2:
-        st.metric(label=f"{ticker} Last Price", value=f"${last_price}")
-except Exception as e:
-    st.error(f"Could not fetch quote for {ticker}: {e}")
-    st.stop()
-
-st.divider()
-
-# Fetch expiration dates
-try:
-    expiry_dates_raw = get_expiry_dates(market, ticker)
-except Exception as e:
-    st.error(f"Could not fetch expiration dates: {e}")
-    st.stop()
-
-if not expiry_dates_raw:
-    st.warning(f"No options available for {ticker}.")
-    st.stop()
-
-expiry_options = []
-for d in expiry_dates_raw:
-    year = d.get("year", 0)
-    month = d.get("month", 0)
-    day = d.get("day", 0)
-    try:
-        date_obj = dt.date(int(year), int(month), int(day))
-        expiry_options.append(date_obj)
-    except (ValueError, TypeError):
-        continue
-
-col_exp, col_type = st.columns(2)
-
-with col_exp:
-    selected_expiry = st.selectbox(
-        "Expiration Date",
-        options=expiry_options,
-        format_func=lambda d: d.strftime("%b %d, %Y"),
-    )
-
-with col_type:
-    chain_type = st.selectbox(
-        "Option Type",
-        options=["Both", "CALL", "PUT"],
-    )
-
-chain_type_param = None if chain_type == "Both" else chain_type
-
-# Fetch option chain
-try:
-    df = get_option_chain(
-        market,
-        ticker,
-        expiry_date=selected_expiry,
-        chain_type=chain_type_param,
-    )
-except Exception as e:
-    st.error(f"Could not fetch option chain: {e}")
-    st.stop()
-
-if df.empty:
-    st.warning("No option chain data returned.")
-    st.stop()
-
-st.subheader(f"Option Chain — {ticker} — {selected_expiry.strftime('%b %d, %Y')}")
-
-# Split into calls and puts for a cleaner view
-if chain_type == "Both":
-    tab_calls, tab_puts = st.tabs(["Calls", "Puts"])
-    calls_df = df[df["Type"] == "Call"].drop(columns=["Type"]).reset_index(drop=True)
-    puts_df = df[df["Type"] == "Put"].drop(columns=["Type"]).reset_index(drop=True)
-
-    with tab_calls:
-        st.dataframe(calls_df, width="stretch", hide_index=True)
-    with tab_puts:
-        st.dataframe(puts_df, width="stretch", hide_index=True)
-elif chain_type == "CALL":
-    st.dataframe(
-        df.drop(columns=["Type"]).reset_index(drop=True),
-        width="stretch",
-        hide_index=True,
-    )
-else:
-    st.dataframe(
-        df.drop(columns=["Type"]).reset_index(drop=True),
-        width="stretch",
-        hide_index=True,
-    )
+pg = st.navigation([discover_page, watchlist_page])
+pg.run()
