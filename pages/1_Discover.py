@@ -1,24 +1,20 @@
-import datetime as dt
 import html
-import math
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-from etrade_market import (
-    get_equity_display_price,
-    get_expiry_dates,
-    get_option_chain,
-    get_quote,
-)
+from etrade_market import get_equity_display_price, get_quote
 
 if st.session_state.get("market") is None:
     st.info("Connect to E-Trade using the sidebar to get started.")
     st.stop()
 
 market = st.session_state.market
+
+# Plotly price chart height (peer/loser tables use the same pixel height)
+PH_PRICE_CHART_HEIGHT = 400
 
 # ── Cached API wrappers ─────────────────────────────────────────────────────
 
@@ -31,15 +27,6 @@ def _cached_quote(_market_id, symbol: str) -> dict | None:
         return q or None
     except Exception:
         return None
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _cached_expiry_dates(_market_id, symbol: str) -> list[dict]:
-    return get_expiry_dates(market, symbol)
-
-@st.cache_data(ttl=120, show_spinner=False)
-def _cached_option_chain(_market_id, symbol: str, expiry_iso: str):
-    expiry_date = dt.date.fromisoformat(expiry_iso)
-    return get_option_chain(market, symbol, expiry_date=expiry_date)
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _cached_yf_info(symbol: str) -> dict:
@@ -67,6 +54,223 @@ def _yf_company_name(symbol: str) -> str:
         return n.strip() if isinstance(n, str) else ""
     except Exception:
         return ""
+
+
+def _bar_calendar_date(ts):
+    """Convert a bar timestamp to a US-Eastern calendar date."""
+    t = pd.Timestamp(ts)
+    if t.tzinfo is not None:
+        t = t.tz_convert("America/New_York")
+    return t.date()
+
+
+def _previous_session_close(ticker_sym: str, hist) -> float | None:
+    """Last daily Close strictly before the first bar's trading day (Yahoo baseline)."""
+    first_day = _bar_calendar_date(hist.index[0])
+    try:
+        end_dt = pd.Timestamp(first_day)
+        start_dt = end_dt - pd.Timedelta(days=45)
+        daily = yf.Ticker(ticker_sym).history(
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=end_dt.strftime("%Y-%m-%d"),
+            interval="1d",
+            auto_adjust=False,
+        )
+    except Exception:
+        daily = None
+    if daily is None or daily.empty:
+        try:
+            daily = yf.Ticker(ticker_sym).history(
+                period="max", interval="1d", auto_adjust=False
+            )
+        except Exception:
+            return None
+    if daily is None or daily.empty:
+        return None
+    ref = None
+    for idx in daily.index:
+        d = _bar_calendar_date(idx)
+        if d < first_day:
+            ref = float(daily.loc[idx, "Close"])
+    return ref
+
+
+def _make_google_style_chart(ticker: str, period_key: str, yf_info: dict):
+    """Price + area chart (Google Finance–style); returns (fig, end_price, chg_pct, baseline)."""
+    pmap = {
+        "1D": ("1d", "5m"),
+        "5D": ("5d", "30m"),
+        "1M": ("1mo", "1d"),
+        "6M": ("6mo", "1d"),
+        "1Y": ("1y", "1d"),
+        "5Y": ("5y", "1wk"),
+    }
+    period, interval = pmap.get(period_key, ("1mo", "1d"))
+    hist = _cached_yf_history(ticker, period, interval)
+    if hist is None or hist.empty:
+        return None, None, None, None
+    hist = hist.sort_index()
+    closes = hist["Close"].astype(float)
+
+    # End price: prefer live yfinance quote, fall back to last bar close.
+    cur_m = yf_info.get("regularMarketPrice") or yf_info.get("currentPrice")
+    last_hist = float(closes.iloc[-1])
+    try:
+        end = float(cur_m) if cur_m is not None and not pd.isna(cur_m) else last_hist
+    except (TypeError, ValueError):
+        end = last_hist
+
+    # Baseline (start price) — matches Yahoo Finance convention:
+    #   1D  → previousClose from yfinance info
+    #   All others → last daily Close before the first bar's calendar date
+    _prev_close_line: float | None = None
+    if period_key == "1D":
+        prev_close = yf_info.get("previousClose") or yf_info.get(
+            "regularMarketPreviousClose"
+        )
+        if prev_close is not None and not pd.isna(prev_close):
+            base = float(prev_close)
+            _prev_close_line = base
+        else:
+            base = float(hist["Open"].iloc[0])
+            _psc = _previous_session_close(ticker, hist)
+            if _psc is not None:
+                _prev_close_line = float(_psc)
+    else:
+        psc = _previous_session_close(ticker, hist)
+        base = psc if psc is not None else float(hist["Open"].iloc[0])
+
+    chg = ((end - base) / base * 100) if base else 0.0
+    up = chg >= 0
+    line_c = "#34a853" if up else "#ea4335"
+    fill_c = "rgba(52, 168, 83, 0.18)" if up else "rgba(234, 67, 53, 0.14)"
+
+    y_min = float(closes.min())
+    y_pad = max(y_min * 0.002, (float(closes.max()) - y_min) * 0.02)
+    y_floor = y_min - y_pad
+
+    fig = go.Figure()
+
+    if period_key == "1D" and _prev_close_line is not None:
+        _x0, _x1 = hist.index[0], hist.index[-1]
+        fig.add_trace(
+            go.Scatter(
+                x=[_x0, _x1],
+                y=[_prev_close_line, _prev_close_line],
+                mode="lines",
+                line=dict(
+                    color="rgba(154, 160, 166, 0.75)",
+                    width=1,
+                    dash="dot",
+                ),
+                showlegend=False,
+                name="",
+                hovertemplate="Prev close $%{y:.2f}<extra></extra>",
+            )
+        )
+
+    def _add_floor_price_pair(
+        xs_d: list,
+        ys_d: list,
+        *,
+        customdata=None,
+        hover_tmpl: str | None = None,
+    ) -> None:
+        if not xs_d:
+            return
+        fl_d = [y_floor] * len(xs_d)
+        fig.add_trace(
+            go.Scatter(
+                x=xs_d,
+                y=fl_d,
+                mode="lines",
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+                name="",
+            )
+        )
+        _ht = hover_tmpl or "%{x}<br>$%{y:.2f}<extra></extra>"
+        _kw = dict(
+            x=xs_d,
+            y=ys_d,
+            mode="lines",
+            line=dict(color=line_c, width=2),
+            fill="tonexty",
+            fillcolor=fill_c,
+            showlegend=False,
+            name="",
+            hovertemplate=_ht,
+        )
+        if customdata is not None:
+            _kw["customdata"] = customdata
+        fig.add_trace(go.Scatter(**_kw))
+
+    xaxis_cfg: dict = dict(
+        showgrid=False,
+        zeroline=False,
+        tickfont=dict(size=11, color="#9aa0a6"),
+        linecolor="rgba(255,255,255,0.08)",
+    )
+
+    if interval in ("1d", "1wk", "1mo"):
+        _add_floor_price_pair(list(hist.index), closes.tolist())
+    elif period_key == "5D":
+        # Sequential integer x-axis so overnight/weekend gaps are collapsed.
+        # One continuous line across all sessions (Google Finance style).
+        _seq_x = list(range(len(closes)))
+        _ys_all = closes.tolist()
+        _real_ts = hist.index
+
+        # Place tick labels at the first bar of each new calendar day.
+        _tvals: list[int] = []
+        _ttxt: list[str] = []
+        _prev_d = None
+        for i, idx in enumerate(_real_ts):
+            d = pd.Timestamp(idx).date()
+            if d != _prev_d:
+                _tvals.append(i)
+                _ttxt.append(f"{pd.Timestamp(idx).strftime('%b')} {d.day}")
+                _prev_d = d
+
+        _cd = [[pd.Timestamp(t).strftime("%b %d, %I:%M %p")] for t in _real_ts]
+        _add_floor_price_pair(
+            _seq_x,
+            _ys_all,
+            customdata=_cd,
+            hover_tmpl="%{customdata[0]}<br>$%{y:.2f}<extra></extra>",
+        )
+        xaxis_cfg.update(
+            type="linear",
+            tickmode="array",
+            tickvals=_tvals,
+            ticktext=_ttxt,
+            range=[-0.5, len(_seq_x) - 0.5],
+        )
+    else:
+        # 1D intraday: real timestamps, single trace.
+        _add_floor_price_pair(list(hist.index), closes.tolist())
+
+    _hover_mode = "closest" if period_key == "5D" else "x unified"
+    fig.update_layout(
+        height=PH_PRICE_CHART_HEIGHT,
+        margin=dict(l=8, r=48, t=12, b=8),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        xaxis=xaxis_cfg,
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.06)",
+            zeroline=False,
+            tickfont=dict(size=11, color="#9aa0a6"),
+            tickprefix="$",
+            side="right",
+        ),
+        hovermode=_hover_mode,
+    )
+    return fig, end, chg, base
+
 
 @st.cache_data(ttl=90, show_spinner=False)
 def _yf_day_moves(symbols: tuple[str, ...]) -> pd.DataFrame:
@@ -96,77 +300,66 @@ def _yf_day_moves(symbols: tuple[str, ...]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ── Scoring helpers ──────────────────────────────────────────────────────────
+def _peer_table_style(df: pd.DataFrame):
+    """Blue symbol text so the cell reads as clickable (matches app link color)."""
 
-def _dte_weight(dd: int) -> float:
-    dd = max(int(dd), 1)
-    if 14 <= dd <= 45:
-        return 1.0
-    if dd < 14:
-        return float(dd / 14.0)
-    return float(math.exp(-0.04 * (dd - 45)))
+    def _row_colors(row: pd.Series) -> pd.Series:
+        return pd.Series(
+            [
+                "color: #58a6ff; font-weight: 600;" if c == "Symbol" else ""
+                for c in row.index
+            ],
+            index=row.index,
+        )
 
-def _iv_to_decimal(iv) -> float:
-    try:
-        v = float(iv)
-    except (TypeError, ValueError):
-        v = 0.25
-    if v > 1.5:
-        v /= 100.0
-    return min(max(v, 0.06), 2.0)
+    return df.style.apply(_row_colors, axis=1)
 
-def _otm_pct(option_type: str, strike: float, spot: float) -> float:
-    if spot <= 0 or strike <= 0:
-        return 0.0
-    if option_type == "Call":
-        return max((strike - spot) / spot * 100.0, 0.0)
-    return max((spot - strike) / spot * 100.0, 0.0)
 
-def _gamma_penalty(dd: int) -> float:
-    dd = max(dd, 1)
-    return 1.0 if dd >= 30 else math.sqrt(30.0 / dd)
-
-def _score_raw(r, dte_days: int, spot: float) -> float:
-    y = max(float(r["Monthly Yield %"]), 0.0)
-    if y <= 0:
-        return 0.0
-    strike = float(r["Strike"])
-    otm = _otm_pct(r["Type"], strike, spot)
-    time_scale = math.sqrt(max(dte_days, 1) / 30.0)
-    adj_cushion = otm / time_scale if time_scale > 0 else otm
-    iv = _iv_to_decimal(r.get("IV", 0))
-    iv_scaled = iv * time_scale
-    dte_w = _dte_weight(dte_days)
-    gamma_p = _gamma_penalty(dte_days)
-    numerator = y * dte_w * (1.0 + 0.12 * adj_cushion)
-    denom = (iv_scaled ** 0.95) * gamma_p
-    return float(12.0 * numerator / denom)
-
-def _score_components(r, dte_days: int, spot: float) -> dict:
-    y = max(float(r.get("Monthly Yield %", 0)), 0.0)
-    income = min(y / 5.0 * 100, 100)
-    strike = float(r.get("Strike", 0))
-    otm = _otm_pct(r.get("Type", "Put"), strike, spot)
-    safety = min(otm / 8.0 * 100, 100)
-    dte_w = _dte_weight(dte_days)
-    gamma_p = _gamma_penalty(dte_days)
-    velocity = min((dte_w / gamma_p) * 100, 100)
-    iv = _iv_to_decimal(r.get("IV", 0))
-    volatility = max(0, min(100, (1.0 - iv) * 100))
-    return {"Income": round(income), "Safety": round(safety),
-            "Velocity": round(velocity), "Volatility": round(volatility)}
-
-def _top_mean(raw, top_k=5):
-    s = raw.fillna(0.0)
-    if s.empty:
-        return 0.0
-    k = min(top_k, len(s))
-    return float(s.nlargest(k).mean())
-
-def _wheel_candidates(chain, spot):
-    wc = (chain["Type"] == "Call") & (chain["Strike"] >= spot) if spot > 0 else (chain["Type"] == "Call")
-    wp = (chain["Type"] == "Put") & (chain["Strike"] <= spot) if spot > 0 else (chain["Type"] == "Put")
-    return chain[(chain["Monthly Yield %"] >= 0.5) & (chain["Strike"] > 0) & (wc | wp)]
+def _render_peer_table(
+    ticker: str,
+    syms: tuple[str, ...],
+    df_key_suffix: str,
+    sort_losers: bool,
+    table_height_px: int,
+) -> None:
+    mov = _yf_day_moves(syms)
+    if mov.empty:
+        st.caption("No data.")
+        return
+    if sort_losers:
+        mov = mov.nsmallest(8, "Δ%").reset_index(drop=True)
+    else:
+        mov = mov.sort_values("Symbol").reset_index(drop=True)
+    peer_df_key = f"ph_peer_df_{ticker}_{df_key_suffix}"
+    mov_styled = _peer_table_style(mov)
+    # single-cell: click the Symbol cell to load (no row checkbox column)
+    st.dataframe(
+        mov_styled,
+        hide_index=True,
+        width="stretch",
+        height=table_height_px,
+        on_select="rerun",
+        selection_mode="single-cell",
+        key=peer_df_key,
+        column_config={
+            "Symbol": st.column_config.TextColumn(
+                help="Click a symbol to open it",
+            ),
+            "Last": st.column_config.NumberColumn(format="$%.2f"),
+            "Δ%": st.column_config.NumberColumn(format="%.2f"),
+        },
+    )
+    picked = st.session_state.get(peer_df_key)
+    cells = (picked or {}).get("selection", {}).get("cells") or []
+    if cells:
+        row_idx, col = cells[0]
+        if col == "Symbol":
+            ri = int(row_idx)
+            if 0 <= ri < len(mov):
+                new_sym = str(mov.iloc[ri]["Symbol"]).upper().strip()
+                if new_sym and new_sym != ticker:
+                    st.session_state.ph_ticker_pending = new_sym
+                    st.rerun()
 
 
 # ── Sector data ──────────────────────────────────────────────────────────────
@@ -190,10 +383,6 @@ _LOSER_UNIVERSE = (
     "JNJ","V","XOM","JPM","WMT","MA","PG","HD","CVX","MRK",
     "ABBV","PEP","KO","COST","AVGO","BAC","PFE","TMO","CSCO","ACN",
     "DIS","ADBE","NFLX","CRM","AMD","INTC","QCOM","TXN","IBM","GE",
-)
-_BENCH_UNIVERSE = (
-    "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","JPM","V",
-    "UNH","XOM","JNJ","WMT","PG","HD","BAC","DIS","NFLX","AMD","INTC",
 )
 
 
@@ -248,450 +437,112 @@ sector = (yf_info.get("sector") or yf_info.get("sectorDisp") or "").strip()
 if sector == "Financials":
     sector = "Financial Services"
 
+if "ph_chart_period" not in st.session_state:
+    st.session_state.ph_chart_period = "1M"
 
-# ── Fetch expirations & compute scores ───────────────────────────────────────
+_PH_PERIOD_LABEL = {
+    "1D": "today",
+    "5D": "past week",
+    "1M": "past month",
+    "6M": "past 6 months",
+    "1Y": "past year",
+    "5Y": "5 years",
+}
 
-try:
-    expiry_dates_raw = _cached_expiry_dates(_mkt_id, ticker)
-except Exception:
-    expiry_dates_raw = []
-expiry_options = []
-for d in expiry_dates_raw:
-    if not isinstance(d, dict):
-        continue
-    try:
-        expiry_options.append(dt.date(
-            int(d.get("year", d.get("Year", 0))),
-            int(d.get("month", d.get("Month", 0))),
-            int(d.get("day", d.get("Day", 0)))))
-    except (ValueError, TypeError):
-        continue
-expiry_options = sorted(set(expiry_options))
-today = dt.date.today()
-future = [d for d in expiry_options if d > today]
-if future:
-    expiry_options = future
-if not expiry_options:
-    st.warning(f"No options available for {ticker}.")
-    st.stop()
+_fig_px, _chart_end, _chart_chg, _chart_base = _make_google_style_chart(
+    ticker, st.session_state.ph_chart_period, yf_info
+)
 
-_cutoff = today + dt.timedelta(days=45)
-_rec_candidates = sorted([d for d in expiry_options if today <= d <= _cutoff])
-_exp_raw_scores = []
-for _exp in _rec_candidates:
-    try:
-        _chain = _cached_option_chain(_mkt_id, ticker, _exp.isoformat())
-    except Exception:
-        continue
-    if _chain is None or _chain.empty:
-        continue
-    _chain = _chain.copy()
-    _d = max((_exp - today).days, 1)
-    _chain["Monthly Yield %"] = _chain.apply(
-        lambda r, dd=_d: round((r["Bid"] / r["Strike"]) * (30 / dd) * 100, 2)
-        if r["Strike"] > 0 else 0.0, axis=1)
-    _cands = _wheel_candidates(_chain, current_price)
-    _pc = _cands[_cands["Type"] == "Put"]
-    _cc = _cands[_cands["Type"] == "Call"]
-    _pr = _pc.apply(lambda row, dd=_d: _score_raw(row, dd, current_price), axis=1)
-    _cr = _cc.apply(lambda row, dd=_d: _score_raw(row, dd, current_price), axis=1)
-    _exp_raw_scores.append({"expiry": _exp, "put_raw": _top_mean(_pr), "call_raw": _top_mean(_cr)})
+if _co:
+    st.markdown(
+        f'<p style="color:#9aa0a6;font-size:0.95rem;margin:0 0 0.25rem 0">{html.escape(_co)}</p>',
+        unsafe_allow_html=True,
+    )
 
-_all_raws = [e["put_raw"] for e in _exp_raw_scores] + [e["call_raw"] for e in _exp_raw_scores]
-_global_min = min(_all_raws) if _all_raws else 0.0
-_global_max = max(_all_raws) if _all_raws else 0.0
-def _normalize(v):
-    if _global_max <= _global_min:
-        return 100.0 if v > 0 else 0.0
-    return float(min(100.0, max(0.0, (v - _global_min) / (_global_max - _global_min) * 100.0)))
-for e in _exp_raw_scores:
-    e["put_score"] = _normalize(e["put_raw"])
-    e["call_score"] = _normalize(e["call_raw"])
-    e["overall"] = max(e["put_score"], e["call_score"])
-_rec_best = max(_exp_raw_scores, key=lambda e: e["overall"]) if _exp_raw_scores else None
-
+if (
+    _chart_end is not None
+    and _chart_chg is not None
+    and _chart_base is not None
+):
+    _hdr_ep = float(_chart_end)
+    _hdr_chg = float(_chart_chg)
+    _dollar_delta = _hdr_ep - float(_chart_base)
+    _hdr_up = _hdr_chg >= 0
+    _hdr_c = "#34a853" if _hdr_up else "#ea4335"
+    _dsign = "+" if _dollar_delta >= 0 else "-"
+    _dabs = abs(_dollar_delta)
+    _arrow = "▲" if _hdr_up else "▼"
+    _span = html.escape(
+        _PH_PERIOD_LABEL.get(st.session_state.ph_chart_period, "period")
+    )
+    _pct_txt = f"{_hdr_chg:+.2f}%"
+    st.markdown(
+        f'<div style="margin:0 0 0.55rem 0;font-family:Inter,sans-serif">'
+        f'<div style="display:flex;align-items:baseline;gap:8px;line-height:1">'
+        f'<span class="mono" style="font-size:2rem;font-weight:500;color:#fff;letter-spacing:-0.02em">'
+        f"{_hdr_ep:.2f}</span>"
+        f'<span style="font-size:0.8rem;color:#9aa0a6;font-weight:400">USD</span>'
+        f"</div>"
+        f'<div style="color:{_hdr_c};font-size:0.95rem;font-weight:500;margin-top:4px;'
+        f'letter-spacing:0.01em">'
+        f"{_dsign}{_dabs:.2f} ({_pct_txt}) "
+        f'<span style="font-size:0.7rem">{_arrow}</span> {_span}'
+        f"</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        f'<div style="margin:0 0 0.55rem 0;font-family:Inter,sans-serif">'
+        f'<div style="display:flex;align-items:baseline;gap:8px;line-height:1">'
+        f'<span class="mono" style="font-size:2rem;font-weight:500;color:#fff;letter-spacing:-0.02em">'
+        f"{float(current_price):.2f}</span>"
+        f'<span style="font-size:0.8rem;color:#9aa0a6;font-weight:400">USD</span>'
+        f"</div>"
+        f'<div style="color:#9aa0a6;font-size:0.9rem;margin-top:4px">No chart data</div>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HEADER BAR — At-a-Glance (sticky)
+# TOP — Google-style chart + market snapshot (peers | losers)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
-h_left, h_center, h_right = st.columns([1.2, 1.5, 1.0])
-
-# LEFT: Ticker + Sparkline
-with h_left:
-    hist = _cached_yf_history(ticker, "1mo", "1d")
-    _spark_html = ""
-    _price_change_html = ""
-    if hist is not None and not hist.empty:
-        hist = hist.sort_index()
-        cur_m = yf_info.get("regularMarketPrice") or yf_info.get("currentPrice")
-        ep = float(cur_m) if cur_m else float(hist["Close"].iloc[-1])
-        sp = float(hist["Close"].iloc[0])
-        chg_pct = ((ep - sp) / sp * 100) if sp else 0
-        is_up = chg_pct >= 0
-        _color = "#00ff88" if is_up else "#ff5252"
-        _sign = "+" if is_up else ""
-
-        closes = list(hist["Close"])
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            y=closes, mode="lines", line=dict(color=_color, width=1.5),
-            showlegend=False, hoverinfo="skip"))
-        fig.update_layout(
-            height=45, margin=dict(l=0, r=0, t=0, b=0),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            xaxis=dict(visible=False), yaxis=dict(visible=False))
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        _price_change_html = (
-            f'<span class="mono" style="font-size:1.3rem;font-weight:700">${ep:.2f}</span>'
-            f'<span style="color:{_color};font-size:0.85rem;margin-left:8px">{_sign}{chg_pct:.1f}%</span>'
+_snap_l, _snap_m, _snap_r = st.columns([2.35, 1.0, 1.0])
+with _snap_l:
+    st.radio(
+        "Chart range",
+        options=["1D", "5D", "1M", "6M", "1Y", "5Y"],
+        horizontal=True,
+        key="ph_chart_period",
+        label_visibility="collapsed",
+    )
+    if _fig_px is not None:
+        st.plotly_chart(
+            _fig_px,
+            use_container_width=True,
+            config={"displayModeBar": False, "scrollZoom": False},
         )
     else:
-        _price_change_html = f'<span class="mono" style="font-size:1.3rem;font-weight:700">${current_price:.2f}</span>'
+        st.caption("No price history for this range.")
 
+with _snap_m:
+    _sec_lbl = html.escape(sector) if sector else "Unknown"
     st.markdown(
-        f'<div style="margin-top:-8px">'
-        f'<span style="color:#94a3b8;font-size:0.75rem">{html.escape(_co)}</span><br>'
-        f'<span class="mono" style="font-size:1.5rem;font-weight:800;color:#fff">{ticker}</span> '
-        f'{_price_change_html}</div>',
-        unsafe_allow_html=True)
-
-# CENTER: Expiry + Hero scores
-with h_center:
-    selected_expiry = st.selectbox(
-        "Expiry", options=expiry_options,
-        format_func=lambda d: d.strftime("%b %d, %Y"),
-        label_visibility="collapsed")
-    dte = max((selected_expiry - today).days, 1)
-    _cur = next((e for e in _exp_raw_scores if e["expiry"] == selected_expiry), None)
-    put_score = _cur["put_score"] if _cur else 0.0
-    call_score = _cur["call_score"] if _cur else 0.0
-
-    def _hero_cls(v):
-        if v >= 66:
-            return "hero-score"
-        if v >= 33:
-            return "hero-score-yellow"
-        return "hero-score-red"
-
-    st.markdown(
-        f"""<div style="display:flex;justify-content:center;align-items:center;gap:28px;margin-top:-4px">
-        <div style="text-align:center">
-            <div class="section-label">Puts</div>
-            <div class="{_hero_cls(put_score)}" style="font-size:3rem">{put_score:.0f}</div>
-        </div>
-        <div style="width:1px;height:48px;background:rgba(255,255,255,0.08)"></div>
-        <div style="text-align:center">
-            <div class="section-label">Calls</div>
-            <div class="{_hero_cls(call_score)}" style="font-size:3rem">{call_score:.0f}</div>
-        </div>
-        </div>
-        <div style="text-align:center;font-size:0.65rem;color:#555;margin-top:2px">{dte}d to expiry</div>""",
-        unsafe_allow_html=True)
-
-# RIGHT: Recommended + watch status
-with h_right:
-    if _rec_best:
-        st.markdown(
-            f'<div class="section-label" style="margin-bottom:4px">Best Expiry</div>'
-            f'<div class="mono" style="font-size:1rem;font-weight:600;color:#00bdff">'
-            f'{_rec_best["expiry"].strftime("%b %d")}</div>'
-            f'<div style="font-size:0.7rem;color:#555">Score {_rec_best["overall"]:.0f}/100</div>',
-            unsafe_allow_html=True)
-    wl = st.session_state.get("ph_watchlist", [])
-    if ticker in wl:
-        st.markdown('<div style="margin-top:6px"><span class="badge badge-green">WATCHING</span></div>',
-                    unsafe_allow_html=True)
-
-st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# GRADIENT GAUGE ARCS — directly under hero scores
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _gauge_arc(value, label):
-    """Plotly half-circle gauge with gradient needle."""
-    if value >= 66:
-        bar_color = "#00ff88"
-        text = "Strong"
-    elif value >= 33:
-        bar_color = "#ffc107"
-        text = "Moderate"
-    else:
-        bar_color = "#ff5252"
-        text = "Weak"
-
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=value,
-        number=dict(font=dict(size=22, color="#e0e0e0", family="Roboto Mono"),
-                    suffix="", valueformat=".0f"),
-        gauge=dict(
-            axis=dict(range=[0, 100], tickwidth=0, tickcolor="rgba(0,0,0,0)",
-                      tickfont=dict(size=1, color="rgba(0,0,0,0)")),
-            bar=dict(color=bar_color, thickness=0.3),
-            bgcolor="rgba(255,255,255,0.04)",
-            borderwidth=0,
-            steps=[
-                dict(range=[0, 33], color="rgba(255,82,82,0.12)"),
-                dict(range=[33, 66], color="rgba(255,193,7,0.12)"),
-                dict(range=[66, 100], color="rgba(0,255,136,0.12)"),
-            ],
-            threshold=dict(line=dict(color="#fff", width=2), thickness=0.75, value=value),
-        ),
-    ))
-    fig.update_layout(
-        height=140, margin=dict(l=20, r=20, t=30, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Inter"),
-        annotations=[dict(
-            text=f'<b>{text}</b>', x=0.5, y=0.15,
-            font=dict(size=13, color=bar_color, family="Inter"),
-            showarrow=False, xref="paper", yref="paper")],
+        f'<div class="section-label" style="margin-bottom:6px">'
+        f"Sector peers ({_sec_lbl})</div>",
+        unsafe_allow_html=True,
     )
-    return fig
+    _peer_src = _SECTOR_PEERS.get(sector, _DEFAULT_SECTOR_PEERS)
+    _peer_syms = tuple(s for s in _peer_src if s != ticker)[:10]
+    _render_peer_table(
+        ticker, _peer_syms, "0", False, PH_PRICE_CHART_HEIGHT
+    )
 
-_g1, _g2 = st.columns(2)
-with _g1:
-    st.markdown('<div class="section-label" style="text-align:center">Put vs Market</div>',
-                unsafe_allow_html=True)
-    st.plotly_chart(_gauge_arc(put_score, "Put"), use_container_width=True,
-                    config={"displayModeBar": False})
-with _g2:
-    st.markdown('<div class="section-label" style="text-align:center">Call vs Market</div>',
-                unsafe_allow_html=True)
-    st.plotly_chart(_gauge_arc(call_score, "Call"), use_container_width=True,
-                    config={"displayModeBar": False})
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# BODY — 60/40 Split: Option Chain | Score Breakdown
-# ═══════════════════════════════════════════════════════════════════════════════
-
-st.markdown("---")
-
-try:
-    df = _cached_option_chain(_mkt_id, ticker, selected_expiry.isoformat())
-except Exception as e:
-    st.error(f"Could not fetch option chain: {e}")
-    st.stop()
-if df is None or df.empty:
-    st.warning("No option chain data for this expiration.")
-    st.stop()
-
-df["Monthly Yield %"] = df.apply(
-    lambda r: round((r["Bid"] / r["Strike"]) * (30 / dte) * 100, 2)
-    if r["Strike"] > 0 else 0.0, axis=1)
-drop_cols = ["Open Interest", "In The Money", "Last"]
-df = df.drop(columns=[c for c in drop_cols if c in df.columns])
-_pct = pd.Series(index=df.index, dtype="float64")
-_ok = (df["Strike"] > 0) & (current_price > 0)
-_pct.loc[_ok] = ((current_price - df.loc[_ok, "Strike"]) / df.loc[_ok, "Strike"] * 100).round(2)
-df.insert(df.columns.get_loc("Strike") + 1, "spot vs strike %", _pct)
-
-calls_df = df[df["Type"] == "Call"].drop(columns=["Type"])
-if current_price > 0:
-    calls_df = calls_df[calls_df["Strike"] >= current_price]
-calls_df = calls_df[calls_df["Monthly Yield %"] >= 0.5].sort_values(
-    "Monthly Yield %", ascending=False).reset_index(drop=True)
-
-puts_df = df[df["Type"] == "Put"].drop(columns=["Type"])
-if current_price > 0:
-    puts_df = puts_df[puts_df["Strike"] <= current_price]
-puts_df = puts_df[puts_df["Monthly Yield %"] >= 0.5].sort_values(
-    "Monthly Yield %", ascending=False).reset_index(drop=True)
-
-
-def _badge(text, cls):
-    return f'<span class="badge badge-{cls}">{text}</span>'
-
-def _yield_pill(y):
-    if y >= 3.0:
-        bg, fg = "rgba(0,255,136,0.15)", "#00ff88"
-    elif y >= 1.5:
-        bg, fg = "rgba(255,193,7,0.12)", "#ffc107"
-    else:
-        bg, fg = "rgba(255,255,255,0.06)", "#94a3b8"
-    return f'<span class="yield-pill" style="background:{bg};color:{fg}">{y:.2f}%</span>'
-
-def _strike_badges(row):
-    tags = []
-    y = float(row.get("Monthly Yield %", 0))
-    iv = _iv_to_decimal(row.get("IV", 0))
-    if y >= 3.0:
-        tags.append(_badge("TARGET YIELD", "green"))
-    if iv > 0.6:
-        tags.append(_badge("HIGH IV", "red"))
-    if dte <= 14:
-        tags.append(_badge("HIGH GAMMA", "yellow"))
-    svs = row.get("spot vs strike %", None)
-    if svs is not None and not (isinstance(svs, float) and math.isnan(svs)):
-        if abs(float(svs)) >= 5:
-            tags.append(_badge("DEEP OTM", "blue"))
-    return " ".join(tags)
-
-def _render_strike_row(r, idx, side):
-    badges = _strike_badges(r)
-    pill = _yield_pill(float(r["Monthly Yield %"]))
-    iv_val = _iv_to_decimal(r.get("IV", 0))
-    return f"""<div class="strike-row" id="strike-{side}-{idx}">
-        <div>
-            <span class="mono" style="font-weight:700;font-size:1rem">${r['Strike']:.2f}</span>
-            {badges}
-        </div>
-        <div style="text-align:right;display:flex;align-items:center;gap:14px">
-            {pill}
-            <span class="dim" style="font-size:0.75rem">Bid ${r['Bid']:.2f}</span>
-            <span class="dim" style="font-size:0.75rem">IV {iv_val:.0%}</span>
-        </div>
-    </div>"""
-
-
-col_chain, col_breakdown = st.columns([3, 2])
-
-with col_chain:
-    tab_calls, tab_puts = st.tabs(["Calls", "Puts"])
-    _TOP_N = 3
-
-    with tab_calls:
-        if calls_df.empty:
-            st.caption("No covered call strikes above spot with yield >= 0.5%.")
-        else:
-            for i in range(min(_TOP_N, len(calls_df))):
-                st.markdown(_render_strike_row(calls_df.iloc[i], i, "call"),
-                            unsafe_allow_html=True)
-            if len(calls_df) > _TOP_N:
-                with st.expander(f"View all {len(calls_df)} call strikes"):
-                    st.dataframe(calls_df, width="stretch", hide_index=True)
-
-    with tab_puts:
-        if puts_df.empty:
-            st.caption("No cash secured put strikes below spot with yield >= 0.5%.")
-        else:
-            for i in range(min(_TOP_N, len(puts_df))):
-                st.markdown(_render_strike_row(puts_df.iloc[i], i, "put"),
-                            unsafe_allow_html=True)
-            if len(puts_df) > _TOP_N:
-                with st.expander(f"View all {len(puts_df)} put strikes"):
-                    st.dataframe(puts_df, width="stretch", hide_index=True)
-
-# RIGHT: Score breakdown (radar + component detail)
-with col_breakdown:
-    st.markdown('<div class="section-label" style="margin-bottom:8px">Score Breakdown</div>',
-                unsafe_allow_html=True)
-
-    _cands_for_radar = _wheel_candidates(df, current_price)
-    def _avg_components(cands_df, side):
-        sub = cands_df[cands_df["Type"] == side]
-        if sub.empty:
-            return {"Income": 0, "Safety": 0, "Velocity": 0, "Volatility": 0}
-        comps = sub.head(5).apply(lambda r: _score_components(r, dte, current_price), axis=1)
-        comp_df = pd.DataFrame(list(comps))
-        return {k: round(comp_df[k].mean()) for k in comp_df.columns}
-
-    put_comp = _avg_components(_cands_for_radar, "Put")
-    call_comp = _avg_components(_cands_for_radar, "Call")
-
-    def _make_radar(components, color_rgb):
-        cats = list(components.keys()) + [list(components.keys())[0]]
-        vals = list(components.values()) + [list(components.values())[0]]
-        fig = go.Figure()
-        fig.add_trace(go.Scatterpolar(
-            r=vals, theta=cats, fill="toself",
-            fillcolor=f"rgba({color_rgb},0.12)",
-            line=dict(color=f"rgb({color_rgb})", width=2)))
-        fig.update_layout(
-            polar=dict(
-                bgcolor="rgba(0,0,0,0)",
-                radialaxis=dict(visible=True, range=[0, 100],
-                                gridcolor="rgba(255,255,255,0.05)",
-                                tickfont=dict(size=8, color="#444")),
-                angularaxis=dict(gridcolor="rgba(255,255,255,0.05)",
-                                 tickfont=dict(size=10, color="#94a3b8", family="Inter"))),
-            showlegend=False, height=210,
-            margin=dict(l=40, r=40, t=20, b=10),
-            paper_bgcolor="rgba(0,0,0,0)")
-        return fig
-
-    _r_tabs = st.tabs(["Put Breakdown", "Call Breakdown"])
-    with _r_tabs[0]:
-        st.plotly_chart(_make_radar(put_comp, "0,255,136"),
-                        use_container_width=True, config={"displayModeBar": False})
-        for k, v in put_comp.items():
-            _bar_c = "#00ff88" if v >= 60 else "#ffc107" if v >= 30 else "#ff5252"
-            st.markdown(
-                f'<div style="display:flex;align-items:center;margin-bottom:4px">'
-                f'<span style="width:80px;font-size:0.75rem;color:#94a3b8">{k}</span>'
-                f'<div style="flex:1;height:6px;background:rgba(255,255,255,0.04);border-radius:3px;overflow:hidden">'
-                f'<div style="width:{v}%;height:100%;background:{_bar_c};border-radius:3px"></div>'
-                f'</div>'
-                f'<span class="mono" style="width:32px;text-align:right;font-size:0.75rem;color:#888;margin-left:6px">{v}</span>'
-                f'</div>', unsafe_allow_html=True)
-
-    with _r_tabs[1]:
-        st.plotly_chart(_make_radar(call_comp, "0,189,255"),
-                        use_container_width=True, config={"displayModeBar": False})
-        for k, v in call_comp.items():
-            _bar_c = "#00bdff" if v >= 60 else "#ffc107" if v >= 30 else "#ff5252"
-            st.markdown(
-                f'<div style="display:flex;align-items:center;margin-bottom:4px">'
-                f'<span style="width:80px;font-size:0.75rem;color:#94a3b8">{k}</span>'
-                f'<div style="flex:1;height:6px;background:rgba(255,255,255,0.04);border-radius:3px;overflow:hidden">'
-                f'<div style="width:{v}%;height:100%;background:{_bar_c};border-radius:3px"></div>'
-                f'</div>'
-                f'<span class="mono" style="width:32px;text-align:right;font-size:0.75rem;color:#888;margin-left:6px">{v}</span>'
-                f'</div>', unsafe_allow_html=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MARKET PEERS (compact, bottom)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-st.markdown("---")
-_p_left, _p_right = st.columns(2)
-with _p_left:
-    st.markdown('<div class="section-label">Sector Peers</div>', unsafe_allow_html=True)
-    peer_src = _SECTOR_PEERS.get(sector, _DEFAULT_SECTOR_PEERS)
-    syms = tuple(s for s in peer_src if s != ticker)[:10]
-    mov = _yf_day_moves(syms)
-    if not mov.empty:
-        mov = mov.sort_values("Symbol").reset_index(drop=True)
-        peer_df_key = f"ph_peer_df_{ticker}_0"
-        st.dataframe(mov, hide_index=True, width="stretch",
-                     height=min(220, 36 + 28 * len(mov)),
-                     on_select="rerun", selection_mode="single-row", key=peer_df_key,
-                     column_config={"Last": st.column_config.NumberColumn(format="$%.2f"),
-                                    "Δ%": st.column_config.NumberColumn(format="%.2f")})
-        picked = st.session_state.get(peer_df_key)
-        rows = (picked or {}).get("selection", {}).get("rows") or []
-        if rows and 0 <= rows[0] < len(mov):
-            new_sym = str(mov.iloc[rows[0]]["Symbol"]).upper().strip()
-            if new_sym and new_sym != ticker:
-                st.session_state.ph_ticker_pending = new_sym
-                st.rerun()
-    else:
-        st.caption("No peer data.")
-
-with _p_right:
-    st.markdown('<div class="section-label">Large-Cap Losers</div>', unsafe_allow_html=True)
-    l_syms = tuple(s for s in _LOSER_UNIVERSE if s != ticker)
-    l_mov = _yf_day_moves(l_syms)
-    if not l_mov.empty:
-        l_mov = l_mov.nsmallest(8, "Δ%").reset_index(drop=True)
-        loser_df_key = f"ph_peer_df_{ticker}_1"
-        st.dataframe(l_mov, hide_index=True, width="stretch",
-                     height=min(220, 36 + 28 * len(l_mov)),
-                     on_select="rerun", selection_mode="single-row", key=loser_df_key,
-                     column_config={"Last": st.column_config.NumberColumn(format="$%.2f"),
-                                    "Δ%": st.column_config.NumberColumn(format="%.2f")})
-        picked = st.session_state.get(loser_df_key)
-        rows = (picked or {}).get("selection", {}).get("rows") or []
-        if rows and 0 <= rows[0] < len(l_mov):
-            new_sym = str(l_mov.iloc[rows[0]]["Symbol"]).upper().strip()
-            if new_sym and new_sym != ticker:
-                st.session_state.ph_ticker_pending = new_sym
-                st.rerun()
-    else:
-        st.caption("No loser data.")
+with _snap_r:
+    st.markdown(
+        '<div class="section-label" style="margin-bottom:6px">Large-cap losers</div>',
+        unsafe_allow_html=True,
+    )
+    _los_syms = tuple(s for s in _LOSER_UNIVERSE if s != ticker)
+    _render_peer_table(ticker, _los_syms, "1", True, PH_PRICE_CHART_HEIGHT)

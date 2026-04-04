@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 40" height="40" width="280">
+  <!-- Crosshair / target icon -->
+  <circle cx="18" cy="20" r="11" fill="none" stroke="#00ff88" stroke-width="2.2"/>
+  <circle cx="18" cy="20" r="5" fill="none" stroke="#00ff88" stroke-width="2"/>
+  <circle cx="18" cy="20" r="1.5" fill="#00ff88"/>
+  <line x1="18" y1="5" x2="18" y2="11" stroke="#00ff88" stroke-width="2" stroke-linecap="round"/>
+  <line x1="18" y1="29" x2="18" y2="35" stroke="#00ff88" stroke-width="2" stroke-linecap="round"/>
+  <line x1="3" y1="20" x2="9" y2="20" stroke="#00ff88" stroke-width="2" stroke-linecap="round"/>
+  <line x1="27" y1="20" x2="33" y2="20" stroke="#00ff88" stroke-width="2" stroke-linecap="round"/>
+  <!-- Brand text -->
+  <text x="42" y="27" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="20" font-weight="700" letter-spacing="1.2">
+    <tspan fill="#e6edf3">PREMIUM</tspan><tspan fill="#00ff88"> HUNTER</tspan>
+  </text>
+</svg>

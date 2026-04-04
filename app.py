@@ -24,7 +24,10 @@ if __name__ == "__main__":
         )
         raise SystemExit(rc)
 
+import html as _html
+
 import streamlit as st
+import yfinance as yf
 
 from etrade_auth import (
     IS_SANDBOX,
@@ -39,6 +42,12 @@ from etrade_market import create_market_session
 
 st.set_page_config(page_title="PremiumHunter", page_icon="🎯", layout="wide")
 
+st.logo(
+    "assets/logo.svg",
+    size="large",
+    icon_image="assets/logo_icon.svg",
+)
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500;700&display=swap');
@@ -48,7 +57,32 @@ st.markdown("""
     background-color: #0e1117;
     font-family: 'Inter', sans-serif;
 }
-html, body, [class*="st-"] {
+html, body {
+    font-family: 'Inter', sans-serif;
+}
+/*
+ * Do NOT use [class*="st-"] { font-family: Inter !important } — it overrides
+ * Streamlit's Material Symbols font so sidebar/header icons show as raw text
+ * (e.g. "keyboard_double_arrow_...").
+ */
+span[data-testid="stIconMaterial"] {
+    font-family: "Material Symbols Rounded" !important;
+    font-weight: normal !important;
+    font-style: normal !important;
+    font-feature-settings: "liga" !important;
+    -webkit-font-feature-settings: "liga" !important;
+    letter-spacing: normal !important;
+    text-transform: none !important;
+    white-space: nowrap !important;
+}
+/* Inter for primary reading surfaces (Streamlit chrome keeps its default fonts) */
+section[data-testid="stMain"],
+section[data-testid="stSidebar"] .block-container {
+    font-family: 'Inter', sans-serif;
+}
+section[data-testid="stMain"] [data-testid="stMarkdownContainer"],
+section[data-testid="stMain"] [data-testid="stHeading"],
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {
     font-family: 'Inter', sans-serif !important;
 }
 code, .stDataFrame td, .stDataFrame th,
@@ -203,11 +237,123 @@ div[data-testid="stExpander"] {
 }
 .dim { color: #555; }
 .mono { font-family: 'Roboto Mono', monospace; }
+
+/* ── Top header bar ──────────────────────────────────────────── */
+.stApp > header,
+header[data-testid="stHeader"] {
+    font-family: 'Inter', sans-serif !important;
+    background: #161b22 !important;
+    border-bottom: 1px solid rgba(255,255,255,0.08) !important;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.40) !important;
+}
+
+/* Wordmark + icon in header (wide SVG) */
+header[data-testid="stHeader"] img[data-testid="stLogo"] {
+    max-height: 30px !important;
+    width: auto !important;
+}
+
+/* Breathing room below app header so first content (index tape) is not clipped */
+section[data-testid="stMain"] > div.block-container {
+    padding-top: 2.65rem !important;
+    overflow: visible !important;
+}
+/* Tape row: padding only above; no bottom pad so the strip sits tight on the divider */
+section[data-testid="stMain"] [data-testid="stHorizontalBlock"]:has([data-testid="stColumn"] [class*="st-key-ph_idx_pick_"]) {
+    padding-top: 0.55rem !important;
+    padding-bottom: 0 !important;
+}
+
+/* ── Index tape: st-key-<key> on widget; stColumn (not "column") is the flex child wrapper ─ */
+section[data-testid="stMain"] [data-testid="stColumn"]:has([class*="st-key-ph_idx_pick_"]),
+section[data-testid="stMain"] [data-testid="column"]:has([class*="st-key-ph_idx_pick_"]) {
+    position: relative !important;
+}
+section[data-testid="stMain"] [data-testid="stColumn"]:has([class*="st-key-ph_idx_pick_"]) [class*="st-key-ph_idx_pick_"],
+section[data-testid="stMain"] [data-testid="column"]:has([class*="st-key-ph_idx_pick_"]) [class*="st-key-ph_idx_pick_"] {
+    position: absolute !important;
+    inset: 0 !important;
+    z-index: 2 !important;
+    margin: 0 !important;
+    height: auto !important;
+}
+section[data-testid="stMain"] [data-testid="stColumn"]:has([class*="st-key-ph_idx_pick_"]) [class*="st-key-ph_idx_pick_"],
+section[data-testid="stMain"] [data-testid="stColumn"]:has([class*="st-key-ph_idx_pick_"]) [class*="st-key-ph_idx_pick_"] *,
+section[data-testid="stMain"] [data-testid="column"]:has([class*="st-key-ph_idx_pick_"]) [class*="st-key-ph_idx_pick_"],
+section[data-testid="stMain"] [data-testid="column"]:has([class*="st-key-ph_idx_pick_"]) [class*="st-key-ph_idx_pick_"] * {
+    background: transparent !important;
+    background-color: transparent !important;
+    box-shadow: none !important;
+}
+section[data-testid="stMain"] [data-testid="stColumn"]:has([class*="st-key-ph_idx_pick_"]) [class*="st-key-ph_idx_pick_"] button,
+section[data-testid="stMain"] [data-testid="column"]:has([class*="st-key-ph_idx_pick_"]) [class*="st-key-ph_idx_pick_"] button {
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    opacity: 0 !important;
+    cursor: pointer !important;
+}
+section[data-testid="stMain"] [data-testid="stColumn"]:has([class*="st-key-ph_idx_pick_"]) [class*="st-key-ph_idx_pick_"] button:focus-visible,
+section[data-testid="stMain"] [data-testid="column"]:has([class*="st-key-ph_idx_pick_"]) [class*="st-key-ph_idx_pick_"] button:focus-visible {
+    opacity: 0.12 !important;
+    outline: 1px solid rgba(88, 166, 255, 0.5) !important;
+}
+/* Invisible pick button is position:absolute — kill the widget row’s layout height so it doesn’t add a gap under the tape */
+section[data-testid="stMain"] [data-testid="element-container"]:has([class*="st-key-ph_idx_pick_"]) {
+    margin-bottom: 0 !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+}
+/* Collapse Streamlit’s default vertical gaps between stacked widgets in each tape cell */
+section[data-testid="stMain"] [data-testid="stColumn"]:has([class*="st-key-ph_idx_pick_"]) [data-testid="element-container"] {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}
+section[data-testid="stMain"] [data-testid="stColumn"]:has([class*="st-key-ph_idx_pick_"]) [data-testid="stVerticalBlock"] {
+    gap: 0 !important;
+    align-items: flex-start !important;
+}
+/* st.html in tape cells: no extra Streamlit spacing */
+section[data-testid="stMain"] [data-testid="stColumn"]:has([class*="st-key-ph_idx_pick_"]) .stHtml,
+section[data-testid="stMain"] [data-testid="stColumn"]:has([class*="st-key-ph_idx_pick_"]) [data-testid="stHtml"] {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+/* ── Top nav page links ──────────────────────────────────────── */
+header nav a,
+header [data-testid="stSidebarNav"] a {
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 0.82rem !important;
+    letter-spacing: 0.04em !important;
+    text-transform: uppercase !important;
+    color: #8b949e !important;
+    text-decoration: none !important;
+    padding: 0.35rem 0.85rem !important;
+    border-radius: 6px !important;
+    transition: color 0.15s ease, background 0.15s ease !important;
+}
+header nav a:hover,
+header [data-testid="stSidebarNav"] a:hover {
+    color: #f0f6fc !important;
+    background: rgba(255,255,255,0.06) !important;
+}
+header nav a[aria-current="page"],
+header [data-testid="stSidebarNav"] a[aria-current="page"] {
+    color: #00ff88 !important;
+    background: rgba(0,255,136,0.10) !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎯 Premium Hunter")
-st.caption("Hunt for the best option premiums — Cash Secured Puts & Covered Calls")
 if IS_SANDBOX:
     st.warning(
         "**Sandbox mode** — The E*Trade sandbox returns static sample data (GOOG from 2012) "
@@ -272,8 +418,100 @@ with st.sidebar:
 
 # ── Page navigation ─────────────────────────────────────────────────────────────
 
-discover_page = st.Page("pages/1_Discover.py", title="Discover", icon="🔍", default=True)
-watchlist_page = st.Page("pages/2_Watchlist.py", title="Watchlist", icon="⭐")
+discover_page = st.Page("pages/1_Discover.py", title="Discover", default=True)
+watchlist_page = st.Page("pages/2_Watchlist.py", title="Watchlist")
 
-pg = st.navigation([discover_page, watchlist_page])
+pg = st.navigation([discover_page, watchlist_page], position="top")
+
+# ── Market index ticker tape ────────────────────────────────────────────────
+# Yahoo symbols drive the tape numbers; E*Trade needs plain equity/ETF tickers
+# for quotes and option chains (e.g. ^GSPC → SPY). Index picks use st.button
+# (tertiary) so the URL does not change — no full browser navigation.
+
+_INDEX_ROWS: list[dict[str, str]] = [
+    {"label": "S&P 500", "yahoo": "^GSPC", "trade": "SPY"},
+    {"label": "Dow 30", "yahoo": "^DJI", "trade": "DIA"},
+    {"label": "Nasdaq", "yahoo": "^IXIC", "trade": "QQQ"},
+    {"label": "Russell 2000", "yahoo": "^RUT", "trade": "IWM"},
+    {"label": "VIX", "yahoo": "^VIX", "trade": "VXX"},
+    {"label": "Gold", "yahoo": "GC=F", "trade": "GLD"},
+    {"label": "Bitcoin USD", "yahoo": "BTC-USD", "trade": "IBIT"},
+]
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_indices() -> list[dict]:
+    results = []
+    for row in _INDEX_ROWS:
+        label = row["label"]
+        ysym = row["yahoo"]
+        trade = row["trade"]
+        try:
+            info = yf.Ticker(ysym).fast_info
+            price = float(info.get("lastPrice", 0) or info.get("last_price", 0))
+            prev = float(info.get("previousClose", 0) or info.get("previous_close", 0))
+            chg = price - prev
+            chg_pct = (chg / prev * 100) if prev else 0.0
+            results.append(
+                dict(
+                    label=label,
+                    yahoo=ysym,
+                    trade_sym=trade,
+                    price=price,
+                    chg=chg,
+                    pct=chg_pct,
+                )
+            )
+        except Exception:
+            results.append(
+                dict(
+                    label=label,
+                    yahoo=ysym,
+                    trade_sym=trade,
+                    price=0,
+                    chg=0,
+                    pct=0,
+                )
+            )
+    return results
+
+
+_idx_data = _fetch_indices()
+
+_tape_cols = st.columns(len(_idx_data))
+for i, ix in enumerate(_idx_data):
+    with _tape_cols[i]:
+        up = ix["chg"] >= 0
+        color = "#3fb950" if up else "#f85149"
+        sign = "+" if up else ""
+        lbl = _html.escape(ix["label"])
+        st.html(
+            f'<div style="line-height:1;margin:0;padding:0.42rem 0 0 0">'
+            f'<div style="color:#58a6ff;font-family:Inter,sans-serif;'
+            f'font-size:0.95rem;font-weight:600;line-height:1.2;margin:0 0 2px 0">{lbl}</div>'
+            f'<div style="font-family:Roboto Mono,monospace;font-size:0.86rem;'
+            f'font-weight:500;color:#c9d1d9;white-space:nowrap;margin:0;line-height:1.25">'
+            f'{ix["price"]:,.2f}</div>'
+            f'<div style="font-family:Roboto Mono,monospace;font-size:0.78rem;'
+            f'font-weight:500;color:{color};white-space:nowrap;margin:0;line-height:1.25">'
+            f'{sign}{ix["chg"]:,.2f} {sign}{ix["pct"]:.2f}%</div>'
+            f'</div>'
+        )
+        if st.button(
+            "\u200b",
+            key=f"ph_idx_pick_{i}",
+            type="tertiary",
+            use_container_width=True,
+            help=f"Load {ix['trade_sym']} (tracks {ix['label']})",
+        ):
+            st.session_state.ph_ticker_pending = ix["trade_sym"]
+            st.session_state.ph_ticker = ix["trade_sym"]
+            st.rerun()
+
+st.markdown(
+    '<div style="border-bottom:1px solid rgba(255,255,255,0.06);'
+    'margin:0"></div>',
+    unsafe_allow_html=True,
+)
+
 pg.run()
