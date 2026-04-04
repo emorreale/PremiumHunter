@@ -17,6 +17,7 @@ from etrade_market import (
     get_option_chain,
     get_quote,
 )
+from watchlist_persist import ensure_session_watchlist, save_watchlist
 
 if st.session_state.get("market") is None:
     st.info("Connect to E-Trade using the sidebar to get started.")
@@ -26,8 +27,20 @@ market = st.session_state.market
 
 # Plotly price chart height (peer/loser tables use the same pixel height)
 PH_PRICE_CHART_HEIGHT = 400
-# Wheel Alpha “safety floor”: Safety Factor = (|OTM %| / target)^2
-PH_WHEEL_TARGET_OTM_PCT = 7.0
+# Wheel Alpha safety divisor = expected 1SD % (IV × sqrt(DTE/365) × 100), not a fixed OTM %
+# Monthly return %: (premium / ref) × (avg days per month / calendar DTE) × 100
+PH_AVG_CALENDAR_DAYS_PER_MONTH = 30.42  # ~365.25 / 12
+# Mo. Return % hinge: below hinge = strict linear penalty (0× at ≤2%, →1× at 3%);
+# at/above hinge = log₂-tuned factor in [0.60, 1.0] to favor higher yields vs heavy log smoothing.
+PH_WHEEL_MO_RETURN_PENALTY_LOW_PCT = 2.0
+PH_WHEEL_MO_RETURN_PENALTY_HIGH_PCT = 3.0
+# Short-DTE “gamma” weight: (calendar DTE / target)^power for DTE < target; 1.0 at/above target.
+PH_WHEEL_DTE_TARGET_DAYS = 5
+PH_WHEEL_DTE_GAMMA_POWER = 3.0  # >2 steeper than (DTE/5)²; 1DTE → 0.008 vs 0.04 at power 2
+# Gamma tax: reward-to-risk vs short DTE — (mo_return/ref) / sqrt(1/DTE), clipped, scales core score.
+PH_GAMMA_TAX_YIELD_REF_PCT = 10.0
+PH_GAMMA_TAX_MULT_MIN = 0.5
+PH_GAMMA_TAX_MULT_MAX = 1.0
 
 # ── Cached API wrappers ─────────────────────────────────────────────────────
 
@@ -190,22 +203,77 @@ def _scan_iv_rank_pct(iv_dec: float | None, lo: float | None, hi: float | None):
     return float(max(0.0, min(100.0, r)))
 
 
+def _mo_return_penalty_factor(mo_return_pct: float) -> float:
+    """Linear penalty for Mo. Return % strictly below hinge: 0× at ≤low, 1× at hinge."""
+    lo = PH_WHEEL_MO_RETURN_PENALTY_LOW_PCT
+    hi = PH_WHEEL_MO_RETURN_PENALTY_HIGH_PCT
+    if mo_return_pct <= lo:
+        return 0.0
+    if mo_return_pct >= hi:
+        return 1.0
+    return float((mo_return_pct - lo) / (hi - lo))
+
+
+def _income_scaling_factor(mo_return_pct: float) -> float:
+    """
+    Yield-side scaling of Wheel Alpha (safety / vol / time unchanged).
+    Below hinge: same strict linear ramp as before (0 at ≤2%, →1 at 3%).
+    At/above hinge: log₂-based factor in [0.60, 1.0], gentler on high yields than log1p.
+    """
+    hi = PH_WHEEL_MO_RETURN_PENALTY_HIGH_PCT
+    if mo_return_pct >= hi:
+        raw_modifier = np.log2(float(mo_return_pct) - hi + 1.0) / np.log2(hi)
+        return float(0.60 + np.clip(raw_modifier, 0.0, 1.0) * 0.40)
+    return _mo_return_penalty_factor(float(mo_return_pct))
+
+
+def _expected_1sd_move_pct(iv_dec: float, calendar_dte: int) -> float:
+    """
+    Expected one-standard-deviation move (%), annualized IV in decimal:
+    IV × sqrt(calendar DTE / 365) × 100.
+    """
+    dte = max(int(calendar_dte), 1)
+    return float(iv_dec * np.sqrt(dte / 365.0) * 100.0)
+
+
+def _dte_weight(calendar_dte: int) -> float:
+    """(DTE/target)^power below target calendar DTE; 1.0 at/above target (gamma-style short-DTE penalty)."""
+    d = max(int(calendar_dte), 0)
+    t = float(PH_WHEEL_DTE_TARGET_DAYS)
+    if d >= t:
+        return 1.0
+    return float((d / t) ** PH_WHEEL_DTE_GAMMA_POWER)
+
+
+def _gamma_tax_multiplier(mo_return_pct: float, calendar_dte: int) -> float:
+    """
+    gamma_risk_factor = sqrt(1 / calendar_DTE); gamma_tax = (mo_return_pct / ref) / that factor.
+    Clipped to [min, max] and applied to core alpha so high-yield short DTE can still score well.
+    """
+    dte_cal = max(int(calendar_dte), 1)
+    gamma_risk_factor = float(np.sqrt(1.0 / dte_cal))
+    gamma_tax = (float(mo_return_pct) / PH_GAMMA_TAX_YIELD_REF_PCT) / gamma_risk_factor
+    return float(np.clip(gamma_tax, PH_GAMMA_TAX_MULT_MIN, PH_GAMMA_TAX_MULT_MAX))
+
+
 def _calculate_wheel_alpha(
     mo_return_pct: float,
     otm_pct: float,
-    dte: int,
+    calendar_dte: int,
     iv_dec: float | None,
     iv_rank: float | None,
     strike: float,
     *,
     cost_basis: float | None,
     is_put: bool,
-    target_otm_pct: float = PH_WHEEL_TARGET_OTM_PCT,
 ) -> float:
     """
     Wheel Alpha: yield × safety vs vol × time, scaled to 0–100.
-    Safety factor uses the “safety floor”: (|OTM %| / target_otm_pct)² so thin
-    cushion is penalized quadratically vs a target (e.g. half target → 0.25×).
+    Safety factor = (|OTM %| / expected 1SD %)² with expected 1SD % = IV×√(DTE/365)×100.
+    DTE weight = (calendar DTE / target)^power below target days, else 1; scales yield×safety.
+    Mo. Return % below 3%: same linear penalty (0× at ≤2%, →1× at 3%). At/above 3%: log₂-tuned
+    factor from 0.60 to 1.0 so higher yields are favored slightly vs heavier log smoothing.
+    Gamma tax: core score × clip((Mo. Return % / ref) / sqrt(1/calendar DTE), 0.5, 1.0).
     """
     if (not is_put) and cost_basis and strike < cost_basis:
         return 0.0
@@ -215,7 +283,8 @@ def _calculate_wheel_alpha(
 
     net_monthly_yield = mo_return_pct - (4.5 / 12.0 if is_put else 0.0)
 
-    _tgt = max(float(target_otm_pct), 0.01)
+    _exp1 = _expected_1sd_move_pct(float(iv_dec), calendar_dte)
+    _tgt = max(_exp1, 0.01)
     _cushion = abs(float(otm_pct))
     safety_factor = (_cushion / _tgt) ** 2
 
@@ -228,14 +297,10 @@ def _calculate_wheel_alpha(
     if vol_penalty <= 0 or not np.isfinite(vol_penalty):
         vol_penalty = 1e-9
 
-    if dte <= 35:
-        time_penalty = 1.0
-    else:
-        time_penalty = float(np.exp(0.012 * (dte - 35)))
-    if time_penalty <= 0 or not np.isfinite(time_penalty):
-        time_penalty = 1e-9
-
-    score = (net_monthly_yield * safety_factor) / (vol_penalty * time_penalty)
+    _dw = _dte_weight(calendar_dte)
+    score = (net_monthly_yield * safety_factor * _dw) / vol_penalty
+    score *= _income_scaling_factor(float(mo_return_pct))
+    score *= _gamma_tax_multiplier(float(mo_return_pct), calendar_dte)
     return float(np.clip(score * 10.0, 0.0, 100.0))
 
 
@@ -637,6 +702,7 @@ def _scan_table_html_fragment(
     max_height_px: int,
     column_order: tuple[str, ...] | None = None,
     column_tips: dict[str, str] | None = None,
+    initial_sort_col: str | None = None,
 ) -> str:
     """
     Wrapped pandas HTML table + client-side sort on header click.
@@ -646,6 +712,14 @@ def _scan_table_html_fragment(
     inner = styler.to_html()
     if column_tips and column_order:
         inner = _scan_html_header_tooltips(inner, column_order, column_tips)
+    _init_sort_js = ""
+    if column_order and initial_sort_col and initial_sort_col in column_order:
+        _isc = list(column_order).index(initial_sort_col)
+        _init_sort_js = f"""
+  sortCol = {_isc};
+  sortDir = -1;
+  resort();
+"""
     # f-string: double {{ }} for literal braces inside JavaScript
     _sort_script = f"""
 <script>
@@ -686,18 +760,24 @@ def _scan_table_html_fragment(
     return cmpKey(ka, kb);
   }}
 
+  function resort() {{
+    if (sortCol < 0) return;
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+    rows.sort(function(a, b) {{ return sortDir * compareRows(a, b, sortCol); }});
+    for (var r = 0; r < rows.length; r++) tbody.appendChild(rows[r]);
+  }}
+
   for (var i = 0; i < ths.length; i++) {{
     (function(colIdx) {{
       var th = ths[colIdx];
       th.addEventListener("click", function() {{
         if (sortCol === colIdx) sortDir = -sortDir;
         else {{ sortCol = colIdx; sortDir = 1; }}
-        var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
-        rows.sort(function(a, b) {{ return sortDir * compareRows(a, b, colIdx); }});
-        for (var r = 0; r < rows.length; r++) tbody.appendChild(rows[r]);
+        resort();
       }});
     }})(i);
   }}
+{_init_sort_js}
 }})();
 </script>
 """
@@ -808,8 +888,7 @@ with _inp_c:
     ticker = (ticker or "").upper().strip()
 with _fav_c:
     if ticker:
-        if "ph_watchlist" not in st.session_state:
-            st.session_state.ph_watchlist = []
+        ensure_session_watchlist()
         _in_wl = ticker in st.session_state.ph_watchlist
         if st.button("★ Watching" if _in_wl else "☆ Watch", key="ph_fav_btn",
                      use_container_width=True):
@@ -817,6 +896,7 @@ with _fav_c:
                 st.session_state.ph_watchlist.remove(ticker)
             else:
                 st.session_state.ph_watchlist.append(ticker)
+            save_watchlist(st.session_state.ph_watchlist)
             st.rerun()
 
 if not ticker:
@@ -1023,7 +1103,7 @@ with _scan_return:
         "Monthly return %",
         min_value=0.0,
         max_value=10.0,
-        value=(3.0, 6.0),
+        value=(3.0, 10.0),
         step=0.5,
         format="%.1f%%",
         key="ph_scan_return_range",
@@ -1031,15 +1111,19 @@ with _scan_return:
     )
 
 _scan_cc_basis = None
-_cb_in = st.number_input(
-    "Share cost basis ($, optional — covered calls)",
-    min_value=0.0,
-    value=0.0,
-    step=0.01,
-    key="ph_scan_cost_basis",
-    disabled=_strategy != "Covered Calls",
-    help="Wheel Alpha is 0 when strike is below this basis (covered calls only).",
-)
+_cb_default = float(current_price) if current_price and current_price > 0 else 0.0
+_cb_col, _ = st.columns([0.26, 0.74])
+with _cb_col:
+    _cb_in = st.number_input(
+        "Share cost basis ($, optional — covered calls)",
+        min_value=0.0,
+        value=_cb_default,
+        step=0.01,
+        key=f"ph_scan_cost_basis__{ticker}",
+        disabled=_strategy != "Covered Calls",
+        help="Wheel Alpha is 0 when strike is below this basis (covered calls only). "
+        "Defaults to the current quote for this ticker.",
+    )
 if _strategy == "Covered Calls" and _cb_in > 0:
     _scan_cc_basis = float(_cb_in)
 
@@ -1066,16 +1150,23 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
             continue
 
         _today = dt.date.today()
-        dte = int(
+        # busday_count excludes the start date but includes the end date, so it does
+        # not count "today" as a session. When expiration is after today, add 1 so DTE
+        # is trading days from today through expiration, inclusive (Mon–Fri; NumPy
+        # does not apply exchange holidays). Same calendar day → 0 (0DTE).
+        _raw_dte = int(
             np.busday_count(
                 np.datetime64(_today),
                 np.datetime64(exp_date),
             )
         )
+        dte = _raw_dte + 1 if exp_date > _today else _raw_dte
         if dte <= 0:
             continue
 
-        months_to_exp = dte / 21.0
+        calendar_dte = (exp_date - _today).days
+        if calendar_dte <= 0:
+            continue
 
         for _, row in chain.iterrows():
             bid = float(row.get("Bid", 0) or 0)
@@ -1096,13 +1187,15 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
                 continue
 
             if _chain_type == "PUT":
-                # CSP: premium / (strike * 100) per contract, annualised to monthly
+                # CSP: premium / strike × (30.42 / calendar DTE) × 100
                 raw_return = bid / strike
             else:
-                # CC: premium / current_price
+                # CC: premium / spot × (30.42 / calendar DTE) × 100
                 raw_return = bid / current_price
 
-            monthly_return = (raw_return / months_to_exp) * 100 if months_to_exp > 0 else 0.0
+            monthly_return = (
+                raw_return * (PH_AVG_CALENDAR_DAYS_PER_MONTH / calendar_dte) * 100.0
+            )
 
             if _ret_range[0] <= monthly_return <= _ret_range[1]:
                 _iv_dec = _scan_iv_to_decimal(row.get("IV"))
@@ -1112,7 +1205,7 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
                 _wheel_alpha = _calculate_wheel_alpha(
                     monthly_return,
                     otm_pct,
-                    dte,
+                    calendar_dte,
                     _iv_dec,
                     _iv_rank,
                     strike,
@@ -1159,18 +1252,31 @@ _SCAN_COL_ORDER = (
 
 _PH_SCAN_COL_HELP: dict[str, str] = {
     "Expiration Date": "Option expiration date (YYYY-MM-DD).",
-    "DTE (Trading Days)": "Trading days until expiration (Mon–Fri count).",
+    "DTE (Trading Days)": (
+        "Trading days from today through expiration, inclusive (Mon–Fri only; "
+        "exchange holidays are not excluded)."
+    ),
     "Strike": "Strike price for this contract.",
     "OTM %": "Moneyness vs spot: negative for OTM puts, positive for OTM calls.",
-    "Mo. Return %": "Estimated premium return per month for this DTE window.",
+    "Mo. Return %": (
+        "(Premium / reference) × (30.42 / calendar days to expiration) × 100. "
+        "Puts: reference = strike. Calls: reference = spot. "
+        "Calendar days = expiration date − today (not trading days)."
+    ),
     "IV": "Implied volatility from the chain (format varies by broker).",
     "IV Rank": (
         "(Current IV − 52w low) / (52w high − 52w low) × 100, clamped 0–100. "
         "52w range uses trailing min/max of 30-day historical vol (annualized) as an IV proxy."
     ),
     "Wheel Alpha": (
-        "Yield × safety vs IV × time (0–100). Safety factor = (|OTM %| / target OTM %)² "
-        f"(target {PH_WHEEL_TARGET_OTM_PCT:g}%). "
+        "Yield × safety vs IV × time (0–100). Safety factor = (|OTM %| / expected 1SD %)² "
+        "with expected 1SD % = IV × √(calendar DTE / 365) × 100 (IV annualized as decimal). "
+        f"DTE weight = (calendar DTE / {PH_WHEEL_DTE_TARGET_DAYS})^"
+        f"{PH_WHEEL_DTE_GAMMA_POWER:g} below {PH_WHEEL_DTE_TARGET_DAYS} days, else 1. "
+        f"Gamma tax × clip((Mo. Return % / {PH_GAMMA_TAX_YIELD_REF_PCT:g}) / √(1/calendar DTE), "
+        f"{PH_GAMMA_TAX_MULT_MIN:g}, {PH_GAMMA_TAX_MULT_MAX:g}). "
+        f"Below {PH_WHEEL_MO_RETURN_PENALTY_HIGH_PCT:g}% Mo. Return: linear 0× at ≤{PH_WHEEL_MO_RETURN_PENALTY_LOW_PCT:g}% "
+        f"to 1× at the hinge. At/above hinge: log₂-tuned factor 0.60–1.0 (favors higher yield). "
         "Puts: monthly return minus 4.5% annual risk-free / 12. "
         "Calls: strikes below optional cost basis score 0."
     ),
@@ -1185,7 +1291,11 @@ _PH_SCAN_COL_HELP: dict[str, str] = {
 if _scan_rows:
     _scan_df = (
         pd.DataFrame(_scan_rows)
-        .sort_values("Mo. Return %", ascending=False)[list(_SCAN_COL_ORDER)]
+        .sort_values(
+            ["Wheel Alpha", "Mo. Return %"],
+            ascending=[False, False],
+            na_position="last",
+        )[list(_SCAN_COL_ORDER)]
     )
     _scan_styled = _scan_table_styler(_scan_df)
     _scan_h = min(400, 35 * len(_scan_df) + 38)
@@ -1202,6 +1312,7 @@ if _scan_rows:
             max_height_px=_scan_h,
             column_order=_SCAN_COL_ORDER,
             column_tips=_PH_SCAN_COL_HELP,
+            initial_sort_col="Wheel Alpha",
         ),
         height=min(520, _scan_h + 22),
         scrolling=True,

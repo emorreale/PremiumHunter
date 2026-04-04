@@ -1,5 +1,6 @@
 .env
 .etrade_tokens.json
+.ph_watchlist.json
 __pycache__/
 *.pyc
 .venv/

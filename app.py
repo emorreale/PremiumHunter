@@ -38,9 +38,11 @@ from etrade_auth import (
     save_persisted_tokens,
 )
 from etrade_market import create_market_session
+from watchlist_persist import ensure_session_watchlist
 
 
-st.set_page_config(page_title="PremiumHunter", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="PremiumHunter", page_icon="assets/logo_icon.svg", layout="wide")
+ensure_session_watchlist()
 
 st.logo(
     "assets/logo.svg",
@@ -99,6 +101,24 @@ code, .stDataFrame td, .stDataFrame th,
     box-shadow: 0 4px 30px rgba(0,0,0,0.5);
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
+}
+
+/* Analyzer matrix: watchlist remove — text-style × (no pill box) */
+section[data-testid="stMain"] div[class*="st-key-ph_mtx_rm_"] {
+    display: flex !important;
+    justify-content: flex-end !important;
+    align-items: flex-start !important;
+}
+section[data-testid="stMain"] div[class*="st-key-ph_mtx_rm_"] button {
+    padding: 0 2px !important;
+    min-height: 1.1rem !important;
+    font-weight: 300 !important;
+    font-size: 1.2rem !important;
+    line-height: 1 !important;
+    color: #7d8590 !important;
+}
+section[data-testid="stMain"] div[class*="st-key-ph_mtx_rm_"] button:hover {
+    color: #f85149 !important;
 }
 
 /* ── Hero score with gradient glow ───────────────────────────── */
@@ -419,11 +439,15 @@ with st.sidebar:
 # ── Page navigation ─────────────────────────────────────────────────────────────
 
 discover_page = st.Page("pages/1_Discover.py", title="Discover", default=True)
-watchlist_page = st.Page("pages/2_Watchlist.py", title="Watchlist")
+analyzer_page = st.Page(
+    "pages/2_Analyzer.py",
+    title="Analyzer",
+    url_path="analyzer",
+)
 
-pg = st.navigation([discover_page, watchlist_page], position="top")
+pg = st.navigation([discover_page, analyzer_page], position="top")
 
-# ── Market index ticker tape ────────────────────────────────────────────────
+# ── Market index ticker tape (Discover only; hidden on Analyzer) ───────────
 # Yahoo symbols drive the tape numbers; E*Trade needs plain equity/ETF tickers
 # for quotes and option chains (e.g. ^GSPC → SPY). Index picks use st.button
 # (tertiary) so the URL does not change — no full browser navigation.
@@ -476,42 +500,43 @@ def _fetch_indices() -> list[dict]:
     return results
 
 
-_idx_data = _fetch_indices()
+if pg.url_path != "analyzer":
+    _idx_data = _fetch_indices()
 
-_tape_cols = st.columns(len(_idx_data))
-for i, ix in enumerate(_idx_data):
-    with _tape_cols[i]:
-        up = ix["chg"] >= 0
-        color = "#3fb950" if up else "#f85149"
-        sign = "+" if up else ""
-        lbl = _html.escape(ix["label"])
-        st.html(
-            f'<div style="line-height:1;margin:0;padding:0.42rem 0 0 0">'
-            f'<div style="color:#58a6ff;font-family:Inter,sans-serif;'
-            f'font-size:0.95rem;font-weight:600;line-height:1.2;margin:0 0 2px 0">{lbl}</div>'
-            f'<div style="font-family:Roboto Mono,monospace;font-size:0.86rem;'
-            f'font-weight:500;color:#c9d1d9;white-space:nowrap;margin:0;line-height:1.25">'
-            f'{ix["price"]:,.2f}</div>'
-            f'<div style="font-family:Roboto Mono,monospace;font-size:0.78rem;'
-            f'font-weight:500;color:{color};white-space:nowrap;margin:0;line-height:1.25">'
-            f'{sign}{ix["chg"]:,.2f} {sign}{ix["pct"]:.2f}%</div>'
-            f'</div>'
-        )
-        if st.button(
-            "\u200b",
-            key=f"ph_idx_pick_{i}",
-            type="tertiary",
-            use_container_width=True,
-            help=f"Load {ix['trade_sym']} (tracks {ix['label']})",
-        ):
-            st.session_state.ph_ticker_pending = ix["trade_sym"]
-            st.session_state.ph_ticker = ix["trade_sym"]
-            st.rerun()
+    _tape_cols = st.columns(len(_idx_data))
+    for i, ix in enumerate(_idx_data):
+        with _tape_cols[i]:
+            up = ix["chg"] >= 0
+            color = "#3fb950" if up else "#f85149"
+            sign = "+" if up else ""
+            lbl = _html.escape(ix["label"])
+            st.html(
+                f'<div style="line-height:1;margin:0;padding:0.42rem 0 0 0">'
+                f'<div style="color:#58a6ff;font-family:Inter,sans-serif;'
+                f'font-size:0.95rem;font-weight:600;line-height:1.2;margin:0 0 2px 0">{lbl}</div>'
+                f'<div style="font-family:Roboto Mono,monospace;font-size:0.86rem;'
+                f'font-weight:500;color:#c9d1d9;white-space:nowrap;margin:0;line-height:1.25">'
+                f'{ix["price"]:,.2f}</div>'
+                f'<div style="font-family:Roboto Mono,monospace;font-size:0.78rem;'
+                f'font-weight:500;color:{color};white-space:nowrap;margin:0;line-height:1.25">'
+                f'{sign}{ix["chg"]:,.2f} {sign}{ix["pct"]:.2f}%</div>'
+                f'</div>'
+            )
+            if st.button(
+                "\u200b",
+                key=f"ph_idx_pick_{i}",
+                type="tertiary",
+                use_container_width=True,
+                help=f"Load {ix['trade_sym']} (tracks {ix['label']})",
+            ):
+                st.session_state.ph_ticker_pending = ix["trade_sym"]
+                st.session_state.ph_ticker = ix["trade_sym"]
+                st.rerun()
 
-st.markdown(
-    '<div style="border-bottom:1px solid rgba(255,255,255,0.06);'
-    'margin:0"></div>',
-    unsafe_allow_html=True,
-)
+    st.markdown(
+        '<div style="border-bottom:1px solid rgba(255,255,255,0.06);'
+        'margin:0"></div>',
+        unsafe_allow_html=True,
+    )
 
 pg.run()
