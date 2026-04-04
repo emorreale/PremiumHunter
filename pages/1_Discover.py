@@ -1,11 +1,22 @@
+import datetime as dt
 import html
+import math
+import re
+import uuid
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 
-from etrade_market import get_equity_display_price, get_quote
+from etrade_market import (
+    get_equity_display_price,
+    get_expiry_dates,
+    get_option_chain,
+    get_quote,
+)
 
 if st.session_state.get("market") is None:
     st.info("Connect to E-Trade using the sidebar to get started.")
@@ -15,6 +26,8 @@ market = st.session_state.market
 
 # Plotly price chart height (peer/loser tables use the same pixel height)
 PH_PRICE_CHART_HEIGHT = 400
+# Wheel Alpha “safety floor”: Safety Factor = (|OTM %| / target)^2
+PH_WHEEL_TARGET_OTM_PCT = 7.0
 
 # ── Cached API wrappers ─────────────────────────────────────────────────────
 
@@ -35,6 +48,58 @@ def _cached_yf_info(symbol: str) -> dict:
     except Exception:
         return {}
 
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_next_earnings_date_str(symbol: str) -> str:
+    """Next upcoming earnings date (YYYY-MM-DD, US/Eastern calendar day), or ""."""
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return ""
+    today = dt.date.today()
+    try:
+        tk = yf.Ticker(sym)
+        cal = tk.calendar
+        if isinstance(cal, dict):
+            eds = cal.get("Earnings Date")
+            if eds is not None and eds != "":
+                if not isinstance(eds, (list, tuple)):
+                    eds = [eds]
+                for d in eds:
+                    if isinstance(d, dt.datetime):
+                        d = d.date()
+                    elif isinstance(d, pd.Timestamp):
+                        d = d.date()
+                    if isinstance(d, dt.date) and d >= today:
+                        return d.strftime("%Y-%m-%d")
+        edf = tk.get_earnings_dates(limit=20)
+        if edf is not None and not edf.empty:
+            for ts in sorted(edf.index):
+                tsn = pd.Timestamp(ts)
+                d = (
+                    tsn.tz_convert("America/New_York").date()
+                    if tsn.tzinfo is not None
+                    else tsn.date()
+                )
+                if d >= today:
+                    return d.strftime("%Y-%m-%d")
+        inf = _cached_yf_info(sym)
+        ts = (
+            inf.get("earningsTimestamp")
+            or inf.get("earningsTimestampStart")
+            or inf.get("earningsTimestampEnd")
+        )
+        if ts is not None:
+            tsn = pd.Timestamp(int(ts), unit="s", tz="UTC").tz_convert(
+                "America/New_York"
+            )
+            d = tsn.date()
+            if d >= today:
+                return d.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return ""
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def _cached_yf_history(symbol: str, period: str, interval: str) -> pd.DataFrame | None:
     try:
@@ -42,6 +107,137 @@ def _cached_yf_history(symbol: str, period: str, interval: str) -> pd.DataFrame 
         return h if h is not None and not h.empty else None
     except Exception:
         return None
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_expiry_dates(_market_id, symbol: str) -> list[dt.date]:
+    try:
+        raw = get_expiry_dates(market, symbol)
+        dates: list[dt.date] = []
+        for entry in raw:
+            y = int(entry.get("year", 0))
+            m = int(entry.get("month", 0))
+            d = int(entry.get("day", 0))
+            if y and m and d:
+                dates.append(dt.date(y, m, d))
+        dates.sort()
+        return dates
+    except Exception:
+        return []
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_option_chain(
+    _market_id, symbol: str, expiry: dt.date, chain_type: str
+) -> pd.DataFrame:
+    try:
+        return get_option_chain(
+            market, symbol, expiry_date=expiry, chain_type=chain_type
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_52w_iv_rank_bounds(symbol: str) -> tuple[float | None, float | None]:
+    """
+    Annualized-volatility low/high (decimal) over the past year for IV Rank.
+
+    Yahoo / E*Trade do not expose a full 52-week implied-volatility series here,
+    so we use the trailing min and max of 30-day historical volatility
+    (close-to-close, annualized) as a stand-in for 52-week IV low / high.
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None, None
+    h = _cached_yf_history(sym, "1y", "1d")
+    if h is None or len(h) < 45:
+        return None, None
+    close = pd.to_numeric(h["Close"], errors="coerce").dropna()
+    if len(close) < 45:
+        return None, None
+    lr = np.log(close / close.shift(1))
+    hv = lr.rolling(30, min_periods=20).std() * np.sqrt(252)
+    hv = hv.dropna()
+    if hv.empty:
+        return None, None
+    lo, hi = float(hv.min()), float(hv.max())
+    if hi - lo < 1e-9:
+        return None, None
+    return lo, hi
+
+
+def _scan_iv_to_decimal(raw) -> float | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        x = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if x <= 0:
+        return None
+    # E*Trade / Yahoo-style: decimals in (0, ~2]; larger values treated as percent.
+    if x > 2.0:
+        x = x / 100.0
+    return x
+
+
+def _scan_iv_rank_pct(iv_dec: float | None, lo: float | None, hi: float | None):
+    if iv_dec is None or lo is None or hi is None:
+        return None
+    span = hi - lo
+    if span <= 1e-10:
+        return None
+    r = (iv_dec - lo) / span * 100.0
+    return float(max(0.0, min(100.0, r)))
+
+
+def _calculate_wheel_alpha(
+    mo_return_pct: float,
+    otm_pct: float,
+    dte: int,
+    iv_dec: float | None,
+    iv_rank: float | None,
+    strike: float,
+    *,
+    cost_basis: float | None,
+    is_put: bool,
+    target_otm_pct: float = PH_WHEEL_TARGET_OTM_PCT,
+) -> float:
+    """
+    Wheel Alpha: yield × safety vs vol × time, scaled to 0–100.
+    Safety factor uses the “safety floor”: (|OTM %| / target_otm_pct)² so thin
+    cushion is penalized quadratically vs a target (e.g. half target → 0.25×).
+    """
+    if (not is_put) and cost_basis and strike < cost_basis:
+        return 0.0
+
+    if iv_dec is None or iv_dec <= 0:
+        return float("nan")
+
+    net_monthly_yield = mo_return_pct - (4.5 / 12.0 if is_put else 0.0)
+
+    _tgt = max(float(target_otm_pct), 0.01)
+    _cushion = abs(float(otm_pct))
+    safety_factor = (_cushion / _tgt) ** 2
+
+    if iv_rank is None or (isinstance(iv_rank, float) and np.isnan(iv_rank)):
+        ir = 50.0
+    else:
+        ir = float(iv_rank)
+
+    vol_penalty = (iv_dec**0.9) * (1.0 + (100.0 - ir) / 100.0)
+    if vol_penalty <= 0 or not np.isfinite(vol_penalty):
+        vol_penalty = 1e-9
+
+    if dte <= 35:
+        time_penalty = 1.0
+    else:
+        time_penalty = float(np.exp(0.012 * (dte - 35)))
+    if time_penalty <= 0 or not np.isfinite(time_penalty):
+        time_penalty = 1e-9
+
+    score = (net_monthly_yield * safety_factor) / (vol_penalty * time_penalty)
+    return float(np.clip(score * 10.0, 0.0, 100.0))
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _yf_company_name(symbol: str) -> str:
@@ -315,6 +511,214 @@ def _peer_table_style(df: pd.DataFrame):
     return df.style.apply(_row_colors, axis=1)
 
 
+def _wheel_alpha_pill_html(v) -> str:
+    """Tight pill/badge around Wheel Alpha value (not full cell)."""
+    if v is None or pd.isna(v):
+        return ""
+    try:
+        vv = float(v)
+    except (TypeError, ValueError):
+        return ""
+    pill = (
+        "display:inline-block;padding:0.18rem 0.55rem;border-radius:8px;"
+        "font-weight:600;line-height:1.2;vertical-align:middle;"
+    )
+    if vv >= 85:
+        pill += "background-color:#00FF88;color:#0d1117;"
+    elif vv >= 65:
+        pill += "background-color:#228B22;color:#ffffff;"
+    elif vv >= 40:
+        pill += "background-color:#FFBF00;color:#1a1a1a;"
+    else:
+        pill += "background-color:#1A1C23;color:#c9d1d9;"
+    return f'<span style="{pill}">{vv:.1f}</span>'
+
+
+def _earn_date_pill_html(earn_s: str, exp_s: str) -> str:
+    """Plain date text, or pink pill when earnings fall before option expiration."""
+    earn_s = (earn_s or "").strip()
+    if not earn_s:
+        return ""
+    esc = html.escape(earn_s)
+    exp_s = (exp_s or "").strip()
+    if not exp_s:
+        return esc
+    try:
+        e_d = dt.datetime.strptime(earn_s, "%Y-%m-%d").date()
+        x_d = dt.datetime.strptime(exp_s, "%Y-%m-%d").date()
+    except ValueError:
+        return esc
+    if e_d < x_d:
+        pill = (
+            "display:inline-block;padding:0.18rem 0.55rem;border-radius:8px;"
+            "font-weight:600;line-height:1.2;vertical-align:middle;"
+            "background-color:rgba(255,170,170,0.55);color:#1a1a1a;"
+        )
+        return f'<span style="{pill}">{esc}</span>'
+    return esc
+
+
+def _scan_table_styler(df: pd.DataFrame):
+    """
+    Build Styler with pill HTML in Wheel Alpha / Earn. Date cells.
+    Use with st.html(styler.to_html()); st.dataframe escapes HTML and shows raw tags.
+    """
+    view = df.copy()
+    view["Wheel Alpha"] = df["Wheel Alpha"].map(_wheel_alpha_pill_html)
+    view["Earn. Date"] = pd.Series(
+        [
+            _earn_date_pill_html(e, x)
+            for e, x in zip(df["Earn. Date"], df["Expiration Date"])
+        ],
+        index=df.index,
+    )
+
+    def _money(x):
+        if pd.isna(x):
+            return ""
+        return f"${float(x):,.2f}"
+
+    def _pct(x):
+        if pd.isna(x):
+            return ""
+        return f"{float(x):.2f}%"
+
+    def _num1(x):
+        if pd.isna(x):
+            return ""
+        return f"{float(x):.1f}"
+
+    def _esc(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return ""
+        return html.escape(str(x).strip())
+
+    fmt = {
+        "Expiration Date": _esc,
+        "DTE (Trading Days)": lambda x: ""
+        if pd.isna(x)
+        else str(int(x)),
+        "Strike": _money,
+        "OTM %": _pct,
+        "Mo. Return %": _pct,
+        "IV": _esc,
+        "IV Rank": _num1,
+        "Wheel Alpha": lambda x: x,
+        "Earn. Date": lambda x: x,
+        "Bid": _money,
+        "Ask": _money,
+        "Volume": lambda x: "" if pd.isna(x) else f"{int(x):,}",
+    }
+    return view.style.format(fmt, escape=None, na_rep="").hide(axis="index")
+
+
+def _scan_html_header_tooltips(
+    table_html: str,
+    column_order: tuple[str, ...],
+    tips: dict[str, str],
+) -> str:
+    """Insert title=\"...\" on <th> for native browser tooltips (hover)."""
+    out = table_html
+    for col in column_order:
+        tip = tips.get(col, "")
+        if not tip:
+            continue
+        ta = html.escape(tip).replace('"', "&quot;")
+        pat = rf'(<th[^>]*?)(\s*>)(\s*{re.escape(col)}\s*</th>)'
+        out, n = re.subn(pat, rf'\1 title="{ta}"\2\3', out, count=1)
+        if n == 0:
+            continue
+    return out
+
+
+def _scan_table_html_fragment(
+    styler,
+    *,
+    max_height_px: int,
+    column_order: tuple[str, ...] | None = None,
+    column_tips: dict[str, str] | None = None,
+) -> str:
+    """
+    Wrapped pandas HTML table + client-side sort on header click.
+    Render with components.html(...) so <script> runs (st.html may strip scripts).
+    """
+    host_id = f"ph-scan-{uuid.uuid4().hex[:12]}"
+    inner = styler.to_html()
+    if column_tips and column_order:
+        inner = _scan_html_header_tooltips(inner, column_order, column_tips)
+    # f-string: double {{ }} for literal braces inside JavaScript
+    _sort_script = f"""
+<script>
+(function() {{
+  var host = document.getElementById("{host_id}");
+  if (!host) return;
+  var table = host.querySelector("table");
+  if (!table) return;
+  var theadRow = table.querySelector("thead tr");
+  var tbody = table.querySelector("tbody");
+  if (!theadRow || !tbody) return;
+  var ths = theadRow.querySelectorAll("th");
+  var sortCol = -1;
+  var sortDir = 1;
+
+  function cellSortKey(text) {{
+    text = (text || "").replace(/\\u00a0/g, " ").trim();
+    if (text === "" || text.toLowerCase() === "nan") return {{ t: "empty", v: 0 }};
+    if (/^\\d{{4}}-\\d{{2}}-\\d{{2}}$/.test(text)) return {{ t: "str", v: text }};
+    var cleaned = text.replace(/[$,]/g, "").replace(/%$/, "").trim();
+    var num = parseFloat(cleaned);
+    if (!isNaN(num) && cleaned !== "") return {{ t: "num", v: num }};
+    return {{ t: "str", v: text.toLowerCase() }};
+  }}
+
+  function cmpKey(ka, kb) {{
+    if (ka.t === "empty" && kb.t === "empty") return 0;
+    if (ka.t === "empty") return 1;
+    if (kb.t === "empty") return -1;
+    if (ka.t === "num" && kb.t === "num") return ka.v - kb.v;
+    if (ka.t === "str" && kb.t === "str") return ka.v < kb.v ? -1 : ka.v > kb.v ? 1 : 0;
+    return String(ka.v).localeCompare(String(kb.v));
+  }}
+
+  function compareRows(a, b, colIdx) {{
+    var ka = cellSortKey(a.cells[colIdx] ? a.cells[colIdx].textContent : "");
+    var kb = cellSortKey(b.cells[colIdx] ? b.cells[colIdx].textContent : "");
+    return cmpKey(ka, kb);
+  }}
+
+  for (var i = 0; i < ths.length; i++) {{
+    (function(colIdx) {{
+      var th = ths[colIdx];
+      th.addEventListener("click", function() {{
+        if (sortCol === colIdx) sortDir = -sortDir;
+        else {{ sortCol = colIdx; sortDir = 1; }}
+        var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+        rows.sort(function(a, b) {{ return sortDir * compareRows(a, b, colIdx); }});
+        for (var r = 0; r < rows.length; r++) tbody.appendChild(rows[r]);
+      }});
+    }})(i);
+  }}
+}})();
+</script>
+"""
+    return (
+        f'<div id="{host_id}" class="ph-scan-table-host" style="overflow:auto;max-height:{max_height_px}px;'
+        f'width:100%;margin:0;padding:0;box-sizing:border-box;">'
+        "<style>"
+        ".ph-scan-table-host table { border-collapse:collapse;width:100%;"
+        "font-size:0.875rem;font-family:Inter,system-ui,sans-serif;color:#e6edf3; }"
+        ".ph-scan-table-host thead th { background:#262730;color:#9aa0a6;font-weight:600;"
+        "padding:0.5rem 0.65rem;text-align:left;border-bottom:1px solid rgba(255,255,255,0.08);"
+        "cursor:pointer;user-select:none; }"
+        ".ph-scan-table-host thead th:hover { color:#e6edf3; }"
+        ".ph-scan-table-host tbody td { padding:0.45rem 0.65rem;"
+        "border-bottom:1px solid rgba(255,255,255,0.06);vertical-align:middle; }"
+        ".ph-scan-table-host tbody tr:hover { background:rgba(255,255,255,0.03); }"
+        "</style>"
+        f"{inner}{_sort_script}</div>"
+    )
+
+
 def _render_peer_table(
     ticker: str,
     syms: tuple[str, ...],
@@ -546,3 +950,386 @@ with _snap_r:
     )
     _los_syms = tuple(s for s in _LOSER_UNIVERSE if s != ticker)
     _render_peer_table(ticker, _los_syms, "1", True, PH_PRICE_CHART_HEIGHT)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OPTIONS SCANNER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _scan_filter_heading(label: str) -> None:
+    st.markdown(
+        '<p style="font-size:0.88rem;color:#9aa0a6;margin:0 0 6px 0;font-weight:600">'
+        f"{html.escape(label)}</p>",
+        unsafe_allow_html=True,
+    )
+
+
+st.markdown("---")
+st.markdown(
+    '<div class="section-label" style="margin-bottom:10px;font-size:1.15rem">'
+    "Options Scanner</div>",
+    unsafe_allow_html=True,
+)
+
+_scan_strategy, _scan_dates, _scan_return = st.columns([1.2, 2.0, 1.5])
+
+with _scan_strategy:
+    _scan_filter_heading("STRATEGY")
+    _strategy = st.radio(
+        "Strategy",
+        options=["Cash Secured Puts", "Covered Calls"],
+        key="ph_scan_strategy",
+        horizontal=False,
+        label_visibility="collapsed",
+    )
+
+_chain_type = "PUT" if _strategy == "Cash Secured Puts" else "CALL"
+
+# Fetch available expirations for the current ticker
+_all_expiries = _cached_expiry_dates(id(market), ticker)
+
+if not _all_expiries:
+    st.warning(f"No option expiration dates found for **{ticker}**.")
+    st.stop()
+
+_min_exp = _all_expiries[0]
+_max_exp = _all_expiries[-1]
+
+with _scan_dates:
+    _scan_filter_heading("EXPIRATION DATE")
+    _dc_from, _dc_to = st.columns(2)
+    with _dc_from:
+        _exp_from = st.date_input(
+            "From",
+            value=_min_exp,
+            min_value=_min_exp,
+            max_value=_max_exp,
+            key="ph_scan_exp_from",
+        )
+    with _dc_to:
+        _default_to = min(
+            _min_exp + dt.timedelta(days=60), _max_exp
+        )
+        _exp_to = st.date_input(
+            "To",
+            value=_default_to,
+            min_value=_min_exp,
+            max_value=_max_exp,
+            key="ph_scan_exp_to",
+        )
+
+with _scan_return:
+    _scan_filter_heading("MONTHLY RETURN %")
+    _ret_range = st.slider(
+        "Monthly return %",
+        min_value=0.0,
+        max_value=10.0,
+        value=(3.0, 6.0),
+        step=0.5,
+        format="%.1f%%",
+        key="ph_scan_return_range",
+        label_visibility="collapsed",
+    )
+
+_scan_cc_basis = None
+_cb_in = st.number_input(
+    "Share cost basis ($, optional — covered calls)",
+    min_value=0.0,
+    value=0.0,
+    step=0.01,
+    key="ph_scan_cost_basis",
+    disabled=_strategy != "Covered Calls",
+    help="Wheel Alpha is 0 when strike is below this basis (covered calls only).",
+)
+if _strategy == "Covered Calls" and _cb_in > 0:
+    _scan_cc_basis = float(_cb_in)
+
+# Filter expiries within the selected date range
+_selected_expiries = [
+    d for d in _all_expiries if _exp_from <= d <= _exp_to
+]
+
+if not _selected_expiries:
+    st.info("No expiration dates in the selected range.")
+    st.stop()
+
+# ── Scan across selected expiries ────────────────────────────────────────────
+
+_iv_bounds_lo, _iv_bounds_hi = _cached_52w_iv_rank_bounds(ticker)
+_earn_date_str = _cached_next_earnings_date_str(ticker)
+
+_scan_rows: list[dict] = []
+
+with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
+    for exp_date in _selected_expiries:
+        chain = _cached_option_chain(id(market), ticker, exp_date, _chain_type)
+        if chain.empty:
+            continue
+
+        _today = dt.date.today()
+        dte = int(
+            np.busday_count(
+                np.datetime64(_today),
+                np.datetime64(exp_date),
+            )
+        )
+        if dte <= 0:
+            continue
+
+        months_to_exp = dte / 21.0
+
+        for _, row in chain.iterrows():
+            bid = float(row.get("Bid", 0) or 0)
+            strike = float(row.get("Strike", 0) or 0)
+            if strike <= 0 or bid <= 0:
+                continue
+
+            otm_pct = (
+                ((strike / current_price) - 1) * 100
+                if current_price > 0
+                else 0.0
+            )
+            # CSP: OTM puts only (strike below spot → negative OTM % here).
+            # CC: OTM calls only (strike above spot → positive OTM % here).
+            if _chain_type == "PUT" and otm_pct >= 0:
+                continue
+            if _chain_type == "CALL" and otm_pct <= 0:
+                continue
+
+            if _chain_type == "PUT":
+                # CSP: premium / (strike * 100) per contract, annualised to monthly
+                raw_return = bid / strike
+            else:
+                # CC: premium / current_price
+                raw_return = bid / current_price
+
+            monthly_return = (raw_return / months_to_exp) * 100 if months_to_exp > 0 else 0.0
+
+            if _ret_range[0] <= monthly_return <= _ret_range[1]:
+                _iv_dec = _scan_iv_to_decimal(row.get("IV"))
+                _iv_rank = _scan_iv_rank_pct(
+                    _iv_dec, _iv_bounds_lo, _iv_bounds_hi
+                )
+                _wheel_alpha = _calculate_wheel_alpha(
+                    monthly_return,
+                    otm_pct,
+                    dte,
+                    _iv_dec,
+                    _iv_rank,
+                    strike,
+                    cost_basis=_scan_cc_basis,
+                    is_put=(_chain_type == "PUT"),
+                )
+                _scan_rows.append({
+                    "Expiration Date": exp_date.strftime("%Y-%m-%d"),
+                    "DTE (Trading Days)": dte,
+                    "Strike": strike,
+                    "OTM %": round(otm_pct, 2),
+                    "Mo. Return %": round(monthly_return, 2),
+                    "IV": row.get("IV", ""),
+                    "IV Rank": (
+                        np.nan
+                        if _iv_rank is None
+                        else round(_iv_rank, 1)
+                    ),
+                    "Wheel Alpha": (
+                        np.nan
+                        if _wheel_alpha != _wheel_alpha
+                        else round(_wheel_alpha, 1)
+                    ),
+                    "Earn. Date": _earn_date_str,
+                    "Bid": bid,
+                    "Ask": float(row.get("Ask", 0) or 0),
+                    "Volume": int(row.get("Volume", 0) or 0),
+                })
+
+_SCAN_COL_ORDER = (
+    "Expiration Date",
+    "DTE (Trading Days)",
+    "Strike",
+    "OTM %",
+    "Mo. Return %",
+    "IV",
+    "IV Rank",
+    "Wheel Alpha",
+    "Earn. Date",
+    "Bid",
+    "Ask",
+    "Volume",
+)
+
+_PH_SCAN_COL_HELP: dict[str, str] = {
+    "Expiration Date": "Option expiration date (YYYY-MM-DD).",
+    "DTE (Trading Days)": "Trading days until expiration (Mon–Fri count).",
+    "Strike": "Strike price for this contract.",
+    "OTM %": "Moneyness vs spot: negative for OTM puts, positive for OTM calls.",
+    "Mo. Return %": "Estimated premium return per month for this DTE window.",
+    "IV": "Implied volatility from the chain (format varies by broker).",
+    "IV Rank": (
+        "(Current IV − 52w low) / (52w high − 52w low) × 100, clamped 0–100. "
+        "52w range uses trailing min/max of 30-day historical vol (annualized) as an IV proxy."
+    ),
+    "Wheel Alpha": (
+        "Yield × safety vs IV × time (0–100). Safety factor = (|OTM %| / target OTM %)² "
+        f"(target {PH_WHEEL_TARGET_OTM_PCT:g}%). "
+        "Puts: monthly return minus 4.5% annual risk-free / 12. "
+        "Calls: strikes below optional cost basis score 0."
+    ),
+    "Earn. Date": (
+        "Next upcoming earnings (Yahoo Finance). Pink pill: earnings before option expiration."
+    ),
+    "Bid": "Option bid.",
+    "Ask": "Option ask.",
+    "Volume": "Contract volume.",
+}
+
+if _scan_rows:
+    _scan_df = (
+        pd.DataFrame(_scan_rows)
+        .sort_values("Mo. Return %", ascending=False)[list(_SCAN_COL_ORDER)]
+    )
+    _scan_styled = _scan_table_styler(_scan_df)
+    _scan_h = min(400, 35 * len(_scan_df) + 38)
+    st.markdown(
+        f'<p style="color:#9aa0a6;font-size:0.88rem;margin:2px 0 4px 0">'
+        f'{len(_scan_df)} contracts found &nbsp;·&nbsp; '
+        f'{_strategy} on <b style="color:#c9d1d9">{ticker}</b> '
+        f'@ ${current_price:,.2f}</p>',
+        unsafe_allow_html=True,
+    )
+    components.html(
+        _scan_table_html_fragment(
+            _scan_styled,
+            max_height_px=_scan_h,
+            column_order=_SCAN_COL_ORDER,
+            column_tips=_PH_SCAN_COL_HELP,
+        ),
+        height=min(520, _scan_h + 22),
+        scrolling=True,
+    )
+else:
+    st.info("No contracts match the selected filters. Try widening the date range or return %.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CANDIDATE BADGE  (Top-3 Weighted Alpha)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _top3_weighted_alpha(scan_rows: list[dict]) -> float | None:
+    scores = [
+        float(r["Wheel Alpha"])
+        for r in scan_rows
+        if r.get("Wheel Alpha") is not None
+        and not (isinstance(r["Wheel Alpha"], float) and np.isnan(r["Wheel Alpha"]))
+    ]
+    if not scores:
+        return None
+    scores.sort(reverse=True)
+    return float(np.mean(scores[:3]))
+
+
+def _candidate_tier(score: float) -> tuple[str, str, str, str]:
+    """(label, colour, glow_colour, context)"""
+    if score >= 90:
+        return (
+            "Extreme",
+            "#00FF88",
+            "rgba(0, 255, 136, 0.35)",
+            'Multiple "mispriced" gems. High IV Rank + High Yield. Strike while the iron is hot.',
+        )
+    if score >= 70:
+        return (
+            "Strong",
+            "#228B22",
+            "rgba(34, 139, 34, 0.30)",
+            "Reliable 3–5% monthly returns with solid cushions. Perfect for the Standard Wheel.",
+        )
+    if score >= 40:
+        return (
+            "Moderate",
+            "#FFBF00",
+            "rgba(255, 191, 0, 0.25)",
+            "Safe, but quiet. Good for capital preservation, lower monthly income.",
+        )
+    return (
+        "Weak",
+        "#ff6b6b",
+        "rgba(255, 107, 107, 0.20)",
+        "Options are cheap (Low IV Rank) or too risky for the pay. Skip for now.",
+    )
+
+
+def _candidate_bar_meter_html(score: float, n_bars: int = 11) -> str:
+    """
+    Signal-style bars as HTML divs (Streamlit's st.html sanitizer often strips SVG).
+    Short red (left) → tall green (right); lit bar count from Top-3 score 0–100.
+    """
+    s = float(max(0.0, min(100.0, score)))
+    active = min(n_bars, max(0, math.ceil(s / 100.0 * n_bars - 1e-9)))
+    max_h = 34
+    min_h = 5
+    w_bar = 5
+    r0, g0, b0 = 234, 67, 53
+    r1, g1, b1 = 0, 255, 136
+    parts: list[str] = []
+    for i in range(n_bars):
+        t = i / (n_bars - 1) if n_bars > 1 else 1.0
+        h = min_h + (max_h - min_h) * t
+        rr = int(r0 + (r1 - r0) * t)
+        gg = int(g0 + (g1 - g0) * t)
+        bb = int(b0 + (b1 - b0) * t)
+        fill = f"#{rr:02x}{gg:02x}{bb:02x}"
+        op = 1.0 if i < active else 0.35
+        parts.append(
+            f'<div style="width:{w_bar}px;height:{h:.1f}px;background:{fill};'
+            f"border-radius:2px;opacity:{op:.2f};flex-shrink:0"
+            f'"></div>'
+        )
+    inner = "".join(parts)
+    return (
+        f'<div role="img" aria-label="Conviction level about {s:.0f} out of 100" '
+        f'style="display:flex;align-items:flex-end;gap:3px;height:40px;min-height:40px;'
+        f"min-width:100px;padding:2px 4px;box-sizing:border-box;flex-shrink:0"
+        f'">'
+        f"{inner}</div>"
+    )
+
+
+_t3_score = _top3_weighted_alpha(_scan_rows)
+
+if _t3_score is not None:
+    _tier_lbl, _tier_c, _tier_glow, _tier_ctx = _candidate_tier(_t3_score)
+    _strat_short = "CSP" if _strategy == "Cash Secured Puts" else "CC"
+    st.html(
+        f'<div style="'
+        f"display:flex;align-items:center;gap:18px;"
+        f"margin:0.35rem 0 0 0;padding:0.7rem 1.1rem;"
+            f"border-radius:12px;"
+            f"border:1px solid {_tier_c}40;"
+            f"background:linear-gradient(135deg, {_tier_glow} 0%, transparent 60%);"
+            f'">'
+            f'<div title="Top-3 weighted alpha: {_t3_score:.1f} / 100">'
+            f"{_candidate_bar_meter_html(_t3_score)}"
+            f"</div>"
+            # text block
+            f'<div style="min-width:0">'
+            f'<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">'
+            f'<span style="font-size:1.15rem;font-weight:700;color:{_tier_c};'
+            f'font-family:Inter,sans-serif;letter-spacing:0.01em">{_tier_lbl}</span>'
+            f'<span style="font-size:0.82rem;color:#9aa0a6;font-weight:500">'
+            f"{_strat_short} Candidate</span>"
+            f"</div>"
+            f'<p style="margin:4px 0 0 0;font-size:0.85rem;color:#c9d1d9;line-height:1.4;'
+            f'font-family:Inter,sans-serif">{html.escape(_tier_ctx)}</p>'
+            f"</div>"
+            f"</div>"
+    )
+else:
+    st.html(
+        '<div style="'
+        "display:flex;align-items:center;gap:14px;"
+        "margin:0.35rem 0 0 0;padding:0.7rem 1.1rem;"
+        "border-radius:12px;border:1px solid #333;background:#1A1C23;"
+        '">'
+        '<span style="font-size:0.9rem;color:#9aa0a6;font-family:Inter,sans-serif">'
+        "No Wheel Alpha scores available to classify this ticker."
+        "</span></div>"
+    )
