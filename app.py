@@ -26,6 +26,8 @@ if __name__ == "__main__":
 
 import html as _html
 
+import logging
+
 import streamlit as st
 import yfinance as yf
 
@@ -40,6 +42,38 @@ from etrade_auth import (
 )
 from etrade_market import create_market_session, probe_etrade_tokens
 from watchlist_persist import ensure_session_watchlist
+
+
+class _PhStreamlitMigrationLogFilter(logging.Filter):
+    """Hide Streamlit layout/API migration noise in the terminal (we use width= / st.iframe)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "use_container_width" in msg and (
+            "Please replace" in msg or "will be removed" in msg
+        ):
+            return False
+        if "st.components.v1.html" in msg and (
+            "Please replace" in msg or "will be removed" in msg
+        ):
+            return False
+        return True
+
+
+for _ph_log_name in ("", "streamlit"):
+    logging.getLogger(_ph_log_name).addFilter(_PhStreamlitMigrationLogFilter())
+
+_ETRADE_LOG = logging.getLogger("premiumhunter.etrade")
+
+
+def _ensure_etrade_connect_logging() -> None:
+    if _ETRADE_LOG.handlers:
+        return
+    _ETRADE_LOG.setLevel(logging.INFO)
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("[premiumhunter.etrade] %(levelname)s %(message)s"))
+    _ETRADE_LOG.addHandler(_h)
+    _ETRADE_LOG.propagate = False
 
 
 st.set_page_config(page_title="PremiumHunter", page_icon="assets/logo_icon.svg", layout="wide")
@@ -391,42 +425,94 @@ if "oauth" not in st.session_state:
     st.session_state.oauth = None
 if "market" not in st.session_state:
     st.session_state.market = None
-if "_disk_tokens_tried" not in st.session_state:
-    st.session_state._disk_tokens_tried = False
+if "_etrade_oauth_message" not in st.session_state:
+    st.session_state._etrade_oauth_message = None
+if "_etrade_oauth_no_credentials" not in st.session_state:
+    st.session_state._etrade_oauth_no_credentials = False
 
-if st.session_state.tokens is None and not st.session_state._disk_tokens_tried:
-    st.session_state._disk_tokens_tried = True
-    saved = load_persisted_tokens()
-    if saved:
-        st.session_state.tokens = saved
-        st.session_state.market = create_market_session(saved)
+
+def _ph_etrade_connect_on_click() -> None:
+    """Runs on the rerun triggered by the button (before the rest of the script)."""
+    st.session_state["_ph_etrade_connect_pending"] = True
+
 
 with st.sidebar:
     st.header("E-Trade Authentication")
 
     if st.session_state.tokens is None:
-        if st.button("Connect to E-Trade"):
-            db_tokens = fetch_latest_tokens_from_postgres()
-            if db_tokens:
-                if probe_etrade_tokens(db_tokens):
-                    save_persisted_tokens(db_tokens)
-                    st.session_state.tokens = db_tokens
-                    st.session_state.market = create_market_session(db_tokens)
-                    st.session_state.oauth = None
-                    st.rerun()
-                st.warning(
-                    "Tokens in the database were found, but E*Trade did not accept them. "
-                    "Use manual authorization below."
-                )
-            try:
-                oauth, auth_url = get_oauth()
-                st.session_state.oauth = oauth
-                st.session_state.auth_url = auth_url
-            except Exception as e:
-                st.error(f"Failed to start OAuth: {e}")
+        st.button(
+            "Connect to E-Trade",
+            key="ph_etrade_connect_btn",
+            on_click=_ph_etrade_connect_on_click,
+        )
+
+        if st.session_state.pop("_ph_etrade_connect_pending", False):
+            _ensure_etrade_connect_logging()
+            _ETRADE_LOG.info(
+                "E*Trade Connect: started (sandbox=%s)",
+                IS_SANDBOX,
+            )
+            with st.spinner("Connecting to E-Trade…"):
+                st.session_state._etrade_oauth_message = None
+                st.session_state._etrade_oauth_no_credentials = False
+                db_tokens = fetch_latest_tokens_from_postgres()
+                disk_tokens = load_persisted_tokens()
+                connected = False
+                for candidate, label in (
+                    (db_tokens, "postgres"),
+                    (disk_tokens, "disk"),
+                ):
+                    if not candidate:
+                        continue
+                    if probe_etrade_tokens(candidate):
+                        save_persisted_tokens(candidate)
+                        st.session_state.tokens = candidate
+                        st.session_state.market = create_market_session(candidate)
+                        st.session_state.oauth = None
+                        st.session_state._etrade_oauth_message = None
+                        st.session_state._etrade_oauth_no_credentials = False
+                        connected = True
+                        _ETRADE_LOG.info(
+                            "E*Trade Connect: OK — reused %s tokens",
+                            label,
+                        )
+                        st.rerun()
+                if not connected:
+                    _ETRADE_LOG.info(
+                        "E*Trade Connect: no valid session (postgres=%s, disk=%s)",
+                        "yes" if db_tokens else "no",
+                        "yes" if disk_tokens else "no",
+                    )
+                    if db_tokens or disk_tokens:
+                        st.session_state._etrade_oauth_message = (
+                            "Your most recent E*Trade token (from the database or this machine) is expired "
+                            "or no longer valid. Renew by opening the authorization link below, then paste "
+                            "the verification code."
+                        )
+                    else:
+                        st.session_state._etrade_oauth_no_credentials = True
+                    try:
+                        oauth, auth_url = get_oauth()
+                        st.session_state.oauth = oauth
+                        st.session_state.auth_url = auth_url
+                        _ETRADE_LOG.info(
+                            "E*Trade Connect: OAuth ready — use the Authorize link in the sidebar",
+                        )
+                    except Exception as e:
+                        st.session_state.oauth = None
+                        _ETRADE_LOG.error("E*Trade Connect: OAuth request failed — %s", e)
+                        st.error(f"Failed to start OAuth: {e}")
 
         if st.session_state.oauth is not None:
-            st.info("1. Click the link below to authorize PremiumHunter")
+            if st.session_state._etrade_oauth_message:
+                st.warning(st.session_state._etrade_oauth_message)
+            if st.session_state._etrade_oauth_no_credentials:
+                st.info(
+                    "No existing credentials were found. "
+                    "Open the authorization link below, then paste the verification code."
+                )
+            else:
+                st.info("1. Click the link below to authorize PremiumHunter")
             st.markdown(f"[Authorize on E-Trade]({st.session_state.auth_url})")
             verifier = st.text_input("2. Paste the verification code here:")
             if verifier:
@@ -435,18 +521,22 @@ with st.sidebar:
                     save_persisted_tokens(tokens)
                     st.session_state.tokens = tokens
                     st.session_state.market = create_market_session(tokens)
+                    st.session_state.oauth = None
+                    st.session_state._etrade_oauth_message = None
+                    st.session_state._etrade_oauth_no_credentials = False
                     st.rerun()
                 except Exception as e:
                     st.error(f"Authentication failed: {e}")
     else:
         st.success("Connected to E-Trade")
-        st.caption("Session is saved on this machine; refresh keeps you signed in.")
+        st.caption("You will be disconneced when session is closed.")
         if st.button("Disconnect"):
             clear_persisted_tokens()
             st.session_state.tokens = None
             st.session_state.oauth = None
             st.session_state.market = None
-            st.session_state._disk_tokens_tried = True
+            st.session_state._etrade_oauth_message = None
+            st.session_state._etrade_oauth_no_credentials = False
             st.rerun()
 
 # ── Page navigation ─────────────────────────────────────────────────────────────
@@ -539,7 +629,7 @@ if pg.url_path != "analyzer":
                 "\u200b",
                 key=f"ph_idx_pick_{i}",
                 type="tertiary",
-                use_container_width=True,
+                width="stretch",
                 help=f"Load {ix['trade_sym']} (tracks {ix['label']})",
             ):
                 st.session_state.ph_ticker_pending = ix["trade_sym"]

@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import json
-import sys
+import logging
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
+
+from watchlist_db import ensure_watchlist_logging, sync_watchlist_to_postgres
 
 _ROOT = Path(__file__).resolve().parent
 load_dotenv(_ROOT / ".env")
 
 _WATCHLIST_PATH = _ROOT / ".ph_watchlist.json"
 _MAX_SYM_LEN = 10
+
+_LOG = logging.getLogger("premiumhunter.watchlist")
 
 
 def _dedupe(symbols: list[str]) -> list[str]:
@@ -53,6 +57,8 @@ def load_watchlist() -> list[str]:
 
 
 def save_watchlist(symbols: list[str]) -> None:
+    ensure_watchlist_logging()
+
     payload = _dedupe(
         [
             str(x).upper().strip()[:_MAX_SYM_LEN]
@@ -60,24 +66,21 @@ def save_watchlist(symbols: list[str]) -> None:
             if x is not None and str(x).strip()
         ]
     )
+    _LOG.info("save_watchlist invoked (%d symbol(s))", len(payload))
+
     try:
         _WATCHLIST_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    except OSError:
-        pass
+    except OSError as e:
+        _LOG.error("Local watchlist write failed %s — %s", _WATCHLIST_PATH, e)
+    else:
+        _LOG.info("Local file OK → %s", _WATCHLIST_PATH)
 
     try:
-        from watchlist_db import sync_watchlist_to_postgres
-
         sync_watchlist_to_postgres(payload)
-    except Exception as e:
-        msg = (
-            "Watchlist saved locally, but Postgres sync failed (GitHub Actions may use an old list): "
-            f"{e}"
+    except Exception:
+        _LOG.exception(
+            "Postgres sync failed after local save (check DATABASE_URL, psycopg, RLS, and pooler)"
         )
-        try:
-            st.warning(msg)
-        except Exception:
-            print(msg, file=sys.stderr)
 
 
 def ensure_session_watchlist() -> None:

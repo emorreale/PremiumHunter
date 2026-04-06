@@ -756,7 +756,7 @@ for row_idx in range(rows_needed):
                             key=f"ph_mtx_rm_{sym}_{row_idx}_{col_idx}",
                             help=f"Remove {sym} from watchlist",
                             type="tertiary",
-                            use_container_width=False,
+                            width="content",
                         ):
                             wl = st.session_state.ph_watchlist
                             if sym in wl:
@@ -767,7 +767,7 @@ for row_idx in range(rows_needed):
                 if spark_fig:
                     st.plotly_chart(
                         spark_fig,
-                        use_container_width=True,
+                        width="stretch",
                         key=f"ph_mtx_spark_{sym}_{row_idx}_{col_idx}",
                         config={"displayModeBar": False},
                     )
@@ -788,7 +788,7 @@ for row_idx in range(rows_needed):
                 with g_left:
                     st.plotly_chart(
                         _gauge_figure(t3),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"ph_mtx_gauge_{sym}_{row_idx}_{col_idx}",
                         config={"displayModeBar": False},
                     )

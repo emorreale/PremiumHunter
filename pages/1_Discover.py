@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
 import yfinance as yf
 from zoneinfo import ZoneInfo
 
@@ -713,7 +712,7 @@ def _scan_table_html_fragment(
 ) -> str:
     """
     Wrapped pandas HTML table + client-side sort on header click.
-    Render with components.html(...) so <script> runs (st.html may strip scripts).
+    Wrapped HTML + client-side sort; embedded via st.iframe so <script> runs in the iframe.
     """
     host_id = f"ph-scan-{uuid.uuid4().hex[:12]}"
     inner = styler.to_html()
@@ -880,7 +879,7 @@ _LOSER_UNIVERSE = (
 # ── Ticker + quote fetch ────────────────────────────────────────────────────
 
 if "ph_ticker" not in st.session_state:
-    st.session_state.ph_ticker = "AAPL"
+    st.session_state.ph_ticker = "SPY"
 _pending_sym = st.session_state.pop("ph_ticker_pending", None)
 if _pending_sym:
     _s = str(_pending_sym).upper().strip()[:10]
@@ -897,8 +896,7 @@ with _fav_c:
     if ticker:
         ensure_session_watchlist()
         _in_wl = ticker in st.session_state.ph_watchlist
-        if st.button("★ Watching" if _in_wl else "☆ Watch", key="ph_fav_btn",
-                     use_container_width=True):
+        if st.button("★ Watching" if _in_wl else "☆ Watch", key="ph_fav_btn", width="stretch"):
             if _in_wl:
                 st.session_state.ph_watchlist.remove(ticker)
             else:
@@ -929,7 +927,7 @@ if sector == "Financials":
     sector = "Financial Services"
 
 if "ph_chart_period" not in st.session_state:
-    st.session_state.ph_chart_period = "1M"
+    st.session_state.ph_chart_period = "1D"
 
 _PH_PERIOD_LABEL = {
     "1D": "today",
@@ -1011,7 +1009,7 @@ with _snap_l:
     if _fig_px is not None:
         st.plotly_chart(
             _fig_px,
-            use_container_width=True,
+            width="stretch",
             config={"displayModeBar": False, "scrollZoom": False},
         )
     else:
@@ -1313,7 +1311,7 @@ if _scan_rows:
         f'@ ${current_price:,.2f}</p>',
         unsafe_allow_html=True,
     )
-    components.html(
+    st.iframe(
         _scan_table_html_fragment(
             _scan_styled,
             max_height_px=_scan_h,
@@ -1321,8 +1319,8 @@ if _scan_rows:
             column_tips=_PH_SCAN_COL_HELP,
             initial_sort_col="Wheel Alpha",
         ),
+        width="stretch",
         height=min(520, _scan_h + 22),
-        scrolling=True,
     )
 else:
     st.info("No contracts match the selected filters. Try widening the date range or return %.")

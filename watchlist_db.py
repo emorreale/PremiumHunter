@@ -2,11 +2,60 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
+import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
+
+_LOG = logging.getLogger("premiumhunter.watchlist")
+
+
+def ensure_watchlist_logging() -> None:
+    """Send premiumhunter.watchlist to stderr once (Streamlit does not configure root logging)."""
+    if _LOG.handlers:
+        return
+    _LOG.setLevel(logging.INFO)
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("[premiumhunter.watchlist] %(levelname)s %(message)s"))
+    _LOG.addHandler(_h)
+    _LOG.propagate = False
+
+
+def _describe_database_url(database_url: str) -> str:
+    """Host/db/user for logs only (no password)."""
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+    except ImportError:
+        return "(psycopg not installed)"
+
+    try:
+        p = conninfo_to_dict(database_url)
+        host = (p.get("host") or "?").strip()
+        db = (p.get("dbname") or p.get("database") or "").strip()
+        user = (p.get("user") or "").strip()
+        port = (p.get("port") or "").strip()
+        parts = [f"host={host!r}"]
+        if user:
+            parts.append(f"user={user!r}")
+        if port:
+            parts.append(f"port={port}")
+        if db:
+            parts.append(f"dbname={db!r}")
+        return " ".join(parts)
+    except Exception as e:
+        return f"(parse error: {e})"
+
+# Only what Streamlit needs on save — avoids running the full migration (ALTER/FK) every click.
+_WATCHLISTS_DDL = """
+CREATE TABLE IF NOT EXISTS watchlists (
+    owner        VARCHAR(64) PRIMARY KEY,
+    symbols      JSONB NOT NULL,
+    updated_at   TIMESTAMP(0) DEFAULT (date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)
+);
+"""
 
 
 def normalize_watchlist_symbols(raw) -> list[str]:
@@ -26,7 +75,10 @@ def normalize_watchlist_symbols(raw) -> list[str]:
 
 
 def prepare_psycopg_dsn(database_url: str) -> str:
-    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+    try:
+        from psycopg.conninfo import conninfo_to_dict, make_conninfo
+    except ImportError:
+        return database_url
 
     try:
         params = dict(conninfo_to_dict(database_url))
@@ -54,41 +106,77 @@ def prepare_psycopg_dsn(database_url: str) -> str:
     return make_conninfo("", **params)
 
 
-def ensure_watchlist_tables(conn) -> None:
-    schema_path = _ROOT / "scripts" / "schema_watchlist_snapshots.sql"
-    schema_sql = schema_path.read_text(encoding="utf-8")
+def ensure_watchlists_table_minimal(conn) -> None:
+    """Create watchlists only (safe for Supabase pooler; no full schema replay)."""
     with conn.cursor() as cur:
-        cur.execute(schema_sql)
+        cur.execute(_WATCHLISTS_DDL)
     conn.commit()
 
 
 def sync_watchlist_to_postgres(symbols: list[str], *, owner: str | None = None) -> None:
     """Upsert watchlists row. No-op if DATABASE_URL is unset. Raises on DB errors."""
+    ensure_watchlist_logging()
+
     database_url = (os.environ.get("DATABASE_URL") or "").strip()
     if not database_url:
+        _LOG.warning("DATABASE_URL is empty — skipping Postgres watchlist sync")
         return
 
     o = (owner or os.environ.get("WATCHLIST_OWNER") or "default").strip() or "default"
+    if len(symbols) <= 12:
+        _sym_preview = repr(symbols)
+    else:
+        _sym_preview = f"{symbols[:12]!r} … (+{len(symbols) - 12} more)"
+    _LOG.info(
+        "Sync start owner=%r count=%d preview=%s | %s",
+        o,
+        len(symbols),
+        _sym_preview,
+        _describe_database_url(database_url),
+    )
 
-    import psycopg
-    from psycopg.types.json import Json
+    try:
+        import psycopg
+        from psycopg.types.json import Json
+    except ImportError:
+        _LOG.error(
+            "psycopg is not installed for this Python: %s\n"
+            "  Install with:  %s -m pip install \"psycopg[binary]>=3.2,<4\"\n"
+            "  (Use the same interpreter you use to run Streamlit — Cursor/VS Code may pick a different one than your terminal.)",
+            sys.executable,
+            sys.executable,
+        )
+        return
 
     dsn = prepare_psycopg_dsn(database_url)
-    with psycopg.connect(dsn) as conn:
-        ensure_watchlist_tables(conn)
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO watchlists (owner, symbols, updated_at)
-                VALUES (
-                    %s,
-                    %s::jsonb,
-                    (date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)
+    try:
+        with psycopg.connect(dsn) as conn:
+            ensure_watchlists_table_minimal(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO watchlists (owner, symbols, updated_at)
+                    VALUES (
+                        %s,
+                        %s::jsonb,
+                        (date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)
+                    )
+                    ON CONFLICT (owner) DO UPDATE SET
+                        symbols = EXCLUDED.symbols,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (o, Json(symbols)),
                 )
-                ON CONFLICT (owner) DO UPDATE SET
-                    symbols = EXCLUDED.symbols,
-                    updated_at = EXCLUDED.updated_at
-                """,
-                (o, Json(symbols)),
-            )
-        conn.commit()
+            conn.commit()
+    except Exception:
+        _LOG.exception(
+            "watchlists upsert failed (%s)",
+            _describe_database_url(database_url),
+        )
+        raise
+
+    _LOG.info(
+        "Sync OK — watchlists row owner=%r updated with %d symbol(s)",
+        o,
+        len(symbols),
+    )
