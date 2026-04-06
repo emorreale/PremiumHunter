@@ -9,6 +9,13 @@ CREATE TABLE IF NOT EXISTS etrade_sessions (
     last_renewed        TIMESTAMP(0) DEFAULT (date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)
 );
 
+-- 1b. Watchlist symbols per owner (GitHub scan merges every row’s symbols, deduped). Full overwrite on upsert.
+CREATE TABLE IF NOT EXISTS watchlists (
+    owner        VARCHAR(64) PRIMARY KEY,
+    symbols      JSONB NOT NULL,
+    updated_at   TIMESTAMP(0) DEFAULT (date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)
+);
+
 -- 2. Raw option-chain data scanned per symbol + strike + expiry.
 CREATE TABLE IF NOT EXISTS options_scans (
     session_id  INTEGER NOT NULL REFERENCES etrade_sessions(session_id),

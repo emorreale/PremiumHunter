@@ -10,13 +10,20 @@ Designed for GitHub Actions (no Streamlit).
 
 Required env:
   DATABASE_URL          — Postgres connection URI
-  WATCHLIST_JSON        — JSON array of tickers, e.g. ["AAPL","NVDA"]
   ETRADE_CONSUMER_KEY, ETRADE_CONSUMER_SECRET
-  ETRADE_OAUTH_TOKEN, ETRADE_OAUTH_TOKEN_SECRET
   ETRADE_SANDBOX        — "true" or "false"
 
+Watchlist source (in priority order):
+  1. WATCHLIST_FILE     — local JSON path (if set, skips DB + secret).
+  2. watchlists table   — merge symbols from every row (all owners), deduped; if table has no rows, fall back.
+  3. WATCHLIST_JSON     — env / secret fallback, e.g. ["AAPL","NVDA"]
+
+Token source (in priority order):
+  1. ETRADE_OAUTH_TOKEN + ETRADE_OAUTH_TOKEN_SECRET env vars (legacy / manual).
+  2. Most-recent row from etrade_sessions table (written by etrade_token_refresh.py).
+
 Optional:
-  WATCHLIST_FILE        — path to JSON file; overrides WATCHLIST_JSON
+  WATCHLIST_FILE        — path to JSON file; overrides DB and WATCHLIST_JSON
   DATABASE_FORCE_IPV4   — if "1"/"true"/"yes", resolve DB host to IPv4 and set libpq hostaddr
                           (GitHub-hosted runners often cannot reach IPv6-only / AAAA-first hosts)
   DATABASE_IPV4         — explicit IPv4 for hostaddr (overrides DATABASE_FORCE_IPV4 resolution)
@@ -44,6 +51,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from dotenv import load_dotenv
+
+from watchlist_db import normalize_watchlist_symbols
 
 load_dotenv(_ROOT / ".env")
 
@@ -221,7 +230,24 @@ def _calculate_wheel_alpha(
 
 # ── Loaders ─────────────────────────────────────────────────────────────────
 
-def _load_symbols() -> list[str]:
+def _load_symbols_from_db_all(conn) -> list[str] | None:
+    """Merge symbols from every watchlists row (deduped); None if no rows (caller may fall back to env)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT symbols FROM watchlists ORDER BY owner")
+        rows = cur.fetchall()
+    if not rows:
+        return None
+    seen: set[str] = set()
+    out: list[str] = []
+    for (sym_json,) in rows:
+        for s in normalize_watchlist_symbols(sym_json):
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+    return out
+
+
+def _load_symbols(conn) -> list[str]:
     fp = os.environ.get("WATCHLIST_FILE", "").strip()
     if fp:
         p = Path(fp)
@@ -229,21 +255,22 @@ def _load_symbols() -> list[str]:
             print(f"WATCHLIST_FILE not found: {fp}", file=sys.stderr)
             sys.exit(1)
         raw = json.loads(p.read_text(encoding="utf-8"))
-    else:
-        raw = json.loads(os.environ.get("WATCHLIST_JSON", "[]"))
-    if isinstance(raw, dict):
-        raw = raw.get("tickers") or raw.get("symbols") or []
-    if not isinstance(raw, list):
+        if not isinstance(raw, list) and not isinstance(raw, dict):
+            print("Watchlist must be a JSON array or {tickers: [...]}", file=sys.stderr)
+            sys.exit(1)
+        return normalize_watchlist_symbols(raw)
+
+    from_db = _load_symbols_from_db_all(conn)
+    if from_db is not None:
+        print(f"Using merged watchlist from Postgres ({len(from_db)} unique symbol(s), all owners).")
+        return from_db
+
+    raw_s = (os.environ.get("WATCHLIST_JSON") or "[]").strip() or "[]"
+    raw = json.loads(raw_s)
+    if not isinstance(raw, list) and not isinstance(raw, dict):
         print("Watchlist must be a JSON array or {tickers: [...]}", file=sys.stderr)
         sys.exit(1)
-    out: list[str] = []
-    seen: set[str] = set()
-    for x in raw:
-        s = str(x).upper().strip()[:10]
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
+    return normalize_watchlist_symbols(raw)
 
 
 # ── DB helpers ──────────────────────────────────────────────────────────────
@@ -337,6 +364,23 @@ def _insert_scan_row(
     )
 
 
+def _load_tokens_from_db(conn) -> tuple[str, str, int] | None:
+    """Read the most recent access tokens from etrade_sessions; returns (token, secret, session_id) or None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT session_id, access_token, access_token_secret
+            FROM etrade_sessions
+            ORDER BY last_renewed DESC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return row[1], row[2], row[0]
+
+
 def _prepare_psycopg_dsn(database_url: str) -> str:
     """Build a libpq DSN, optionally pinning hostaddr to IPv4 for CI (matches psycopg URL parsing)."""
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
@@ -383,25 +427,9 @@ def main() -> int:
         print("DATABASE_URL is required", file=sys.stderr)
         return 1
 
-    symbols = _load_symbols()
-    if not symbols:
-        print("No symbols to sync (empty watchlist).")
-        return 0
-
-    tok = (os.environ.get("ETRADE_OAUTH_TOKEN") or "").strip()
-    sec = (os.environ.get("ETRADE_OAUTH_TOKEN_SECRET") or "").strip()
-    if not tok or not sec:
-        print("ETRADE_OAUTH_TOKEN and ETRADE_OAUTH_TOKEN_SECRET are required", file=sys.stderr)
-        return 1
     if not os.environ.get("ETRADE_CONSUMER_KEY") or not os.environ.get("ETRADE_CONSUMER_SECRET"):
         print("ETRADE_CONSUMER_KEY and ETRADE_CONSUMER_SECRET are required", file=sys.stderr)
         return 1
-
-    import etrade_market as em
-
-    market = em.create_market_session(
-        {"oauth_token": tok, "oauth_token_secret": sec},
-    )
 
     try:
         import psycopg
@@ -412,7 +440,36 @@ def main() -> int:
     dsn = _prepare_psycopg_dsn(database_url)
     with psycopg.connect(dsn) as conn:
         _ensure_tables(conn)
-        session_id = _upsert_session(conn, tok, sec)
+        symbols = _load_symbols(conn)
+        if not symbols:
+            print("No symbols to sync (empty watchlist).")
+            return 0
+
+        tok = (os.environ.get("ETRADE_OAUTH_TOKEN") or "").strip()
+        sec = (os.environ.get("ETRADE_OAUTH_TOKEN_SECRET") or "").strip()
+        session_id: int | None = None
+
+        if tok and sec:
+            print("Using OAuth tokens from environment.")
+            session_id = _upsert_session(conn, tok, sec)
+        else:
+            db_result = _load_tokens_from_db(conn)
+            if db_result:
+                tok, sec, session_id = db_result
+                print(f"Using OAuth tokens from etrade_sessions (session_id={session_id}).")
+            else:
+                print(
+                    "No OAuth tokens found. Set ETRADE_OAUTH_TOKEN + ETRADE_OAUTH_TOKEN_SECRET, "
+                    "or run etrade_token_refresh.py first to populate etrade_sessions.",
+                    file=sys.stderr,
+                )
+                return 1
+
+        import etrade_market as em
+
+        market = em.create_market_session(
+            {"oauth_token": tok, "oauth_token_secret": sec},
+        )
 
         total_rows = 0
         today = _scan_date_chicago()

@@ -32,12 +32,13 @@ import yfinance as yf
 from etrade_auth import (
     IS_SANDBOX,
     clear_persisted_tokens,
+    fetch_latest_tokens_from_postgres,
     get_access_tokens,
     get_oauth,
     load_persisted_tokens,
     save_persisted_tokens,
 )
-from etrade_market import create_market_session
+from etrade_market import create_market_session, probe_etrade_tokens
 from watchlist_persist import ensure_session_watchlist
 
 
@@ -405,6 +406,18 @@ with st.sidebar:
 
     if st.session_state.tokens is None:
         if st.button("Connect to E-Trade"):
+            db_tokens = fetch_latest_tokens_from_postgres()
+            if db_tokens:
+                if probe_etrade_tokens(db_tokens):
+                    save_persisted_tokens(db_tokens)
+                    st.session_state.tokens = db_tokens
+                    st.session_state.market = create_market_session(db_tokens)
+                    st.session_state.oauth = None
+                    st.rerun()
+                st.warning(
+                    "Tokens in the database were found, but E*Trade did not accept them. "
+                    "Use manual authorization below."
+                )
             try:
                 oauth, auth_url = get_oauth()
                 st.session_state.oauth = oauth

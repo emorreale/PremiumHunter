@@ -121,6 +121,21 @@ def get_quote_status(quote_row: dict) -> str:
     return _quote_status(quote_row)
 
 
+def probe_etrade_tokens(tokens: dict, symbol: str = "SPY") -> bool:
+    """True if E*Trade accepts these access tokens for a simple quote (live or sandbox)."""
+    if not tokens or not tokens.get("oauth_token") or not tokens.get("oauth_token_secret"):
+        return False
+    try:
+        m = create_market_session(tokens)
+        q = get_quote(m, symbol)
+        if not q:
+            return False
+        price, _ = get_equity_display_price(q)
+        return price is not None
+    except Exception:
+        return False
+
+
 def get_expiry_dates(market, symbol: str) -> list[dict]:
     """Fetch option expiration entries (year/month/day) for a symbol."""
     resp = market.get_option_expire_date(symbol, resp_format="json")

@@ -3,20 +3,22 @@
 #
 # Required repository secrets:
 #   DATABASE_URL              — postgresql://... (Supabase: prefer pooler URI for CI; password must be URL-encoded)
-#   DATABASE_IPV4             — optional; if the DB hostname has no A record, set explicit IPv4
 #   ETRADE_CONSUMER_KEY       — same as local .env
 #   ETRADE_CONSUMER_SECRET
-#   ETRADE_OAUTH_TOKEN        — access token (oauth_token from .etrade_tokens.json)
-#   ETRADE_OAUTH_TOKEN_SECRET — access token secret
-#   ETRADE_SANDBOX            — exactly "true" or "false" (must match token environment)
-#   WATCHLIST_JSON            — e.g. ["AAPL","NVDA","VXX"]  (repo file is gitignored locally)
+#   ETRADE_USERNAME           — E*Trade login username
+#   ETRADE_PASSWORD           — E*Trade login password
+#   ETRADE_SANDBOX            — exactly "true" or "false"
+#   WATCHLIST_JSON            — optional if watchlists has at least one row (scan merges all owners); else e.g. ["AAPL","NVDA"]
 #
-# E*Trade tokens expire; refresh them locally and update secrets when quotes start failing.
+# Optional secrets:
+#   ETRADE_TOTP_SECRET        — base32 TOTP secret for 2FA (omit if no 2FA)
+#   DATABASE_IPV4             — explicit IPv4 for hostaddr if DB DNS is IPv6-only
 #
-# GitHub-hosted runners often cannot reach databases over IPv6. DATABASE_FORCE_IPV4 makes the
-# script pin libpq hostaddr to IPv4 using the same URL parser as psycopg (urllib alone can
-# mis-parse passwords with @, etc.). Supabase: use Project Settings → Database → Connection
-# string → “Session pooler” or “Transaction pooler” (e.g. *.pooler.supabase.com:6543) if needed.
+# OAuth refresh (Playwright + login) runs only when:
+#   • workflow_dispatch (manual), or
+#   • the 8:30 America/Chicago cron (first run of the day).
+# All other scheduled runs only execute the scan; it reuses tokens already in etrade_sessions.
+# If a later run fails with auth errors, run the workflow manually once to refresh.
 #
 name: Watchlist scan → Postgres
 
@@ -24,7 +26,6 @@ on:
   workflow_dispatch:
   schedule:
     # US equity RTH in Central: 8:30–15:00 (8:30 AM first run, 3:00 PM last), every 30 min, Mon–Fri.
-    # (GitHub cron + IANA tz; does not skip exchange holidays.)
     - cron: "30 8 * * 1-5"
       timezone: "America/Chicago"
     - cron: "0,30 9-14 * * 1-5"
@@ -48,8 +49,26 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-ci.txt
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: pip install -r requirements-ci.txt
+
+      - name: Install Playwright browser
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 8 * * 1-5'
+        run: playwright install chromium --with-deps
+
+      - name: Refresh E*Trade OAuth tokens
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 8 * * 1-5'
+        env:
+          DATABASE_FORCE_IPV4: "1"
+          DATABASE_IPV4: ${{ secrets.DATABASE_IPV4 }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ETRADE_CONSUMER_KEY: ${{ secrets.ETRADE_CONSUMER_KEY }}
+          ETRADE_CONSUMER_SECRET: ${{ secrets.ETRADE_CONSUMER_SECRET }}
+          ETRADE_USERNAME: ${{ secrets.ETRADE_USERNAME }}
+          ETRADE_PASSWORD: ${{ secrets.ETRADE_PASSWORD }}
+          ETRADE_TOTP_SECRET: ${{ secrets.ETRADE_TOTP_SECRET }}
+          ETRADE_SANDBOX: ${{ secrets.ETRADE_SANDBOX }}
+        run: python scripts/etrade_token_refresh.py
 
       - name: Run watchlist scan + Wheel Alpha
         env:
@@ -58,8 +77,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ETRADE_CONSUMER_KEY: ${{ secrets.ETRADE_CONSUMER_KEY }}
           ETRADE_CONSUMER_SECRET: ${{ secrets.ETRADE_CONSUMER_SECRET }}
-          ETRADE_OAUTH_TOKEN: ${{ secrets.ETRADE_OAUTH_TOKEN }}
-          ETRADE_OAUTH_TOKEN_SECRET: ${{ secrets.ETRADE_OAUTH_TOKEN_SECRET }}
           ETRADE_SANDBOX: ${{ secrets.ETRADE_SANDBOX }}
+          # Omit WATCHLIST_JSON when watchlists has at least one row (scan merges symbols from every owner).
           WATCHLIST_JSON: ${{ secrets.WATCHLIST_JSON }}
         run: python scripts/watchlist_snapshot_to_postgres.py
