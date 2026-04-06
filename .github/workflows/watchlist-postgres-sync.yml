@@ -2,7 +2,7 @@
 # and write to PostgreSQL: etrade_sessions, options_scans, wheel_alpha_results.
 #
 # Required repository secrets:
-#   DATABASE_URL              — postgresql://... (use SSL params if your host requires it)
+#   DATABASE_URL              — postgresql://... (Supabase: prefer pooler URI for CI; password must be URL-encoded)
 #   DATABASE_IPV4             — optional; if the DB hostname has no A record, set explicit IPv4
 #   ETRADE_CONSUMER_KEY       — same as local .env
 #   ETRADE_CONSUMER_SECRET
@@ -13,8 +13,10 @@
 #
 # E*Trade tokens expire; refresh them locally and update secrets when quotes start failing.
 #
-# GitHub-hosted runners often cannot reach databases over IPv6. If DATABASE_URL resolves to
-# IPv6 first, set DATABASE_FORCE_IPV4 below (or put the DB host’s IPv4 in secret DATABASE_IPV4).
+# GitHub-hosted runners often cannot reach databases over IPv6. DATABASE_FORCE_IPV4 makes the
+# script pin libpq hostaddr to IPv4 using the same URL parser as psycopg (urllib alone can
+# mis-parse passwords with @, etc.). Supabase: use Project Settings → Database → Connection
+# string → “Session pooler” or “Transaction pooler” (e.g. *.pooler.supabase.com:6543) if needed.
 #
 name: Watchlist scan → Postgres
 

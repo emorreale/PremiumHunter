@@ -21,6 +21,10 @@ Optional:
   DATABASE_FORCE_IPV4   — if "1"/"true"/"yes", resolve DB host to IPv4 and set libpq hostaddr
                           (GitHub-hosted runners often cannot reach IPv6-only / AAAA-first hosts)
   DATABASE_IPV4         — explicit IPv4 for hostaddr (overrides DATABASE_FORCE_IPV4 resolution)
+
+Supabase from GitHub Actions: use the dashboard *connection pooler* URI (Transaction or Session,
+host like *.pooler.supabase.com, often port 6543) if direct db.*.supabase.co still fails; ensure
+the password in DATABASE_URL is URL-encoded (e.g. @ → %40).
 """
 from __future__ import annotations
 
@@ -32,7 +36,6 @@ import socket
 import sys
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
 
 import numpy as np
 
@@ -252,24 +255,42 @@ def _insert_scan_and_result(
     )
 
 
-def _psycopg_connect_kwargs(database_url: str) -> dict:
-    """Optional hostaddr so CI can use IPv4 when DNS prefers unreachable IPv6 (e.g. GitHub Actions)."""
-    explicit = (os.environ.get("DATABASE_IPV4") or "").strip()
-    if explicit:
-        return {"hostaddr": explicit}
-    flag = (os.environ.get("DATABASE_FORCE_IPV4") or "").strip().lower()
-    if flag not in ("1", "true", "yes", "on"):
-        return {}
-    host = urlparse(database_url).hostname
-    if not host:
-        return {}
+def _prepare_psycopg_dsn(database_url: str) -> str:
+    """Build a libpq DSN, optionally pinning hostaddr to IPv4 for CI (matches psycopg URL parsing)."""
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
     try:
-        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
-    except OSError:
-        return {}
-    if not infos:
-        return {}
-    return {"hostaddr": infos[0][4][0]}
+        params = dict(conninfo_to_dict(database_url))
+    except Exception:
+        return database_url
+
+    explicit = (os.environ.get("DATABASE_IPV4") or "").strip()
+    flag = (os.environ.get("DATABASE_FORCE_IPV4") or "").strip().lower()
+    want_v4 = flag in ("1", "true", "yes", "on")
+    host = (params.get("host") or "").strip()
+    path_host = host.startswith("/")
+
+    if explicit:
+        params["hostaddr"] = explicit
+    elif want_v4 and host and not path_host:
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        except OSError:
+            infos = []
+        if infos:
+            params["hostaddr"] = infos[0][4][0]
+        else:
+            print(
+                f"DATABASE_FORCE_IPV4 is set but no IPv4 (A record) was found for host {host!r}. "
+                "If you use Supabase, try the pooler connection string from the dashboard "
+                "(host *.pooler.supabase.com, port 6543 for transaction mode). "
+                "Ensure special characters in the DB password are URL-encoded in DATABASE_URL.",
+                file=sys.stderr,
+            )
+
+    if "hostaddr" not in params:
+        return database_url
+    return make_conninfo("", **params)
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -306,7 +327,8 @@ def main() -> int:
         print("Install psycopg: pip install 'psycopg[binary]'", file=sys.stderr)
         return 1
 
-    with psycopg.connect(database_url, **_psycopg_connect_kwargs(database_url)) as conn:
+    dsn = _prepare_psycopg_dsn(database_url)
+    with psycopg.connect(dsn) as conn:
         _ensure_tables(conn)
         _upsert_session(conn, tok, sec)
 
