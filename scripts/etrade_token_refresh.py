@@ -21,7 +21,10 @@ Required env:
   ETRADE_SANDBOX          — "true" or "false"
 
 Optional:
-  ETRADE_TOTP_SECRET      — base32 TOTP secret for 2FA (skip if account has no 2FA)
+  ETRADE_TOTP_SECRET      — base32 TOTP secret for 2FA (skip if account has no 2FA).
+                            For E*Trade VIP enrollment, mint a credential locally:
+                            pip install -r requirements-etrade-tools.txt
+                            python scripts/etrade_vipaccess_provision.py
   DATABASE_FORCE_IPV4     — "1" to force IPv4 (same as watchlist sync)
   DATABASE_IPV4           — explicit IPv4 hostaddr
   PLAYWRIGHT_HEADLESS     — set "false" to show the browser locally while debugging

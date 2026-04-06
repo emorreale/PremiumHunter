@@ -1,0 +1,5 @@
+# Local-only: provision Symantec VIP-style credentials for E*Trade authenticator enrollment.
+#   pip install -r requirements-etrade-tools.txt
+#   python scripts/etrade_vipaccess_provision.py
+python-vipaccess>=0.14.2,<0.15
+pyotp>=2.9,<3
