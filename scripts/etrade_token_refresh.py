@@ -162,11 +162,11 @@ def _verifier_from_url(url: str) -> str | None:
 
 
 def _login_roots(page):
-    """Main document plus child frames (E*Trade often embeds the form in an iframe)."""
-    yield page
+    """Child frames first (OAuth often embeds the form), then main frame."""
     for fr in page.frames:
         if fr != page.main_frame:
             yield fr
+    yield page
 
 
 def _fill_first_visible(root, selectors: tuple[str, ...], value: str) -> bool:
@@ -209,6 +209,52 @@ def _click_first_visible_tree(page, selectors: tuple[str, ...]) -> bool:
         if _click_first_visible(root, selectors):
             return True
     return False
+
+
+def _check_use_security_code_checkbox(root) -> None:
+    """VIP / SYMC: same-page login often requires this before the security code field appears."""
+    try:
+        cb = root.get_by_role("checkbox", name=re.compile(r"security\s*code", re.I))
+        if cb.count():
+            first = cb.first
+            if first.is_visible() and not first.is_checked():
+                first.check(timeout=5000)
+                return
+    except Exception:
+        pass
+    try:
+        lab = root.locator("label").filter(has_text=re.compile(r"use\s+security\s+code", re.I)).first
+        if lab.count() and lab.is_visible():
+            lab.click(timeout=5000)
+    except Exception:
+        pass
+
+
+def _try_login_one_root(
+    root,
+    username: str,
+    password: str,
+    totp_secret: str,
+    user_selectors: tuple[str, ...],
+    pass_selectors: tuple[str, ...],
+    otp_selectors: tuple[str, ...],
+    logon_selectors: tuple[str, ...],
+) -> bool:
+    """
+    Fill user + password in the *same* document/frame, optionally same-page TOTP, then Log on.
+    Returns True if credentials were filled and submit was clicked in this root.
+    """
+    if not _fill_first_visible(root, user_selectors, username):
+        return False
+    if not _fill_first_visible(root, pass_selectors, password):
+        return False
+    if (totp_secret or "").strip():
+        _check_use_security_code_checkbox(root)
+        getattr(root, "page", root).wait_for_timeout(900)
+        import pyotp
+
+        _fill_first_visible(root, otp_selectors, pyotp.TOTP(totp_secret.strip()).now())
+    return _click_first_visible(root, logon_selectors)
 
 
 def _print_login_diagnostics(page, totp_secret: str) -> None:
@@ -283,7 +329,7 @@ def _obtain_tokens() -> dict:
         page.goto(auth_url, wait_until="domcontentloaded", timeout=90000)
         page.wait_for_timeout(3000)
 
-        # ── Login (main page + iframes) ──────────────────────────────────
+        # ── Login (same frame for user+pass; VIP = check "Use security code" + TOTP before Log on)
         user_selectors = (
             "input[name='USER']",
             "#user_orig",
@@ -292,12 +338,29 @@ def _obtain_tokens() -> dict:
             "input[name='userId']",
             "input[id*='user' i][type='text']",
             "input[autocomplete='username']",
+            "input[placeholder*='User ID' i]",
+            "input[placeholder*='user id' i]",
+            "input[aria-label*='User' i]",
         )
         pass_selectors = (
             "input[name='PASSWORD']",
             "#txtPassword",
             "input[type='password']",
             "input[autocomplete='current-password']",
+            "input[placeholder*='Password' i]",
+            "input[aria-label*='Password' i]",
+        )
+        otp_selectors = (
+            "#otp_code",
+            "input[name='otp_code']",
+            "input[name='otpCode']",
+            "input[name='securityCode']",
+            "input[name*='security' i][type='text']",
+            "input[id*='security' i]",
+            "input[inputmode='numeric']",
+            "input[type='tel']",
+            "input[placeholder*='code' i]",
+            "input[placeholder*='Security' i]",
         )
         logon_selectors = (
             "#logon_button",
@@ -309,19 +372,30 @@ def _obtain_tokens() -> dict:
             "input[type='submit']",
         )
 
-        if not _fill_first_visible_tree(page, user_selectors, username):
+        login_clicked = False
+        for root in _login_roots(page):
+            if _try_login_one_root(
+                root,
+                username,
+                password,
+                totp_secret,
+                user_selectors,
+                pass_selectors,
+                otp_selectors,
+                logon_selectors,
+            ):
+                login_clicked = True
+                break
+
+        if not login_clicked:
             _fail_browser(
                 page,
                 browser,
-                "ERROR: Could not find username field (try iframe or E*Trade UI change).",
+                "ERROR: Could not complete login in any frame (user+password+optional TOTP in same frame).",
                 f"Page URL: {page.url}",
             )
-        if not _fill_first_visible_tree(page, pass_selectors, password):
-            _fail_browser(page, browser, "ERROR: Could not find password field.", f"Page URL: {page.url}")
 
         prev_url = page.url
-        if not _click_first_visible_tree(page, logon_selectors):
-            _fail_browser(page, browser, "ERROR: Could not find Log On / submit control.", f"Page URL: {page.url}")
 
         def _wait_off_login_screen(timeout_s: float) -> None:
             deadline = time.time() + timeout_s
@@ -353,20 +427,11 @@ def _obtain_tokens() -> dict:
                 f"Page URL: {page.url}",
             )
 
-        # ── 2FA / TOTP ──────────────────────────────────────────────────
+        # ── 2FA / TOTP (second step if not same-page as login) ─────────
         if totp_secret:
             import pyotp
 
             totp = pyotp.TOTP(totp_secret)
-            otp_selectors = (
-                "#otp_code",
-                "input[name='otp_code']",
-                "input[name='otpCode']",
-                "input[name='securityCode']",
-                "input[inputmode='numeric']",
-                "input[type='tel']",
-                "input[placeholder*='code' i]",
-            )
             otp_submit = (
                 "#submit_otp",
                 "button:has-text('Submit')",
