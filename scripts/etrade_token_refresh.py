@@ -97,6 +97,14 @@ def _locator_visible_timeout_ms() -> int:
     return 2200
 
 
+_RUN_T0 = time.time()
+
+
+def _log_step(message: str) -> None:
+    elapsed = time.time() - _RUN_T0
+    print(f"[premiumhunter.etrade.refresh] +{elapsed:05.1f}s {message}")
+
+
 def _debug_png_path() -> Path:
     """CI: GITHUB_WORKSPACE so upload-artifact can collect; else OS temp dir."""
     ws = (os.environ.get("GITHUB_WORKSPACE") or "").strip()
@@ -401,6 +409,7 @@ def _obtain_tokens() -> dict:
         "yes",
     )
 
+    _log_step("Requesting OAuth request token")
     oauth = pyetrade.ETradeOAuth(consumer_key, consumer_secret)
     auth_url = oauth.get_request_token()
     print(f"Authorization URL obtained (sandbox={is_sandbox})")
@@ -425,6 +434,7 @@ def _obtain_tokens() -> dict:
         "--window-size=1920,1080",
     ]
 
+    _log_step(f"Launching Playwright Chromium (headless={headless})")
     with sync_playwright() as pw:
         try:
             browser = pw.chromium.launch(
@@ -446,6 +456,7 @@ def _obtain_tokens() -> dict:
         )
         context.add_init_script(_STEALTH_INIT_JS)
         page = context.new_page()
+        _log_step("Warming E*Trade origin and opening authorize URL")
         _warmup_etrade_origin(page, auth_url)
         page.goto(auth_url, wait_until="domcontentloaded", timeout=90000)
         page.wait_for_timeout(random.randint(2200, 4200) if _human_delays_enabled() else 3000)
@@ -493,6 +504,7 @@ def _obtain_tokens() -> dict:
             "input[type='submit']",
         )
 
+        _log_step("Attempting login submit (user/password + optional same-page TOTP)")
         login_clicked = False
         for root in _login_roots(page):
             if _try_login_one_root(
@@ -517,6 +529,7 @@ def _obtain_tokens() -> dict:
             )
 
         prev_url = page.url
+        _log_step("Login submitted; waiting to leave /etx/pxy/login")
 
         def _wait_off_login_screen(timeout_s: float) -> None:
             deadline = time.time() + timeout_s
@@ -551,6 +564,7 @@ def _obtain_tokens() -> dict:
             )
 
         # ── 2FA / TOTP (second step if not same-page as login) ─────────
+        _log_step("Checking for second-step OTP challenge")
         if totp_secret:
             import pyotp
 
@@ -568,6 +582,7 @@ def _obtain_tokens() -> dict:
                 page.wait_for_timeout(2500)
 
         # ── Accept / Authorize ───────────────────────────────────────────
+        _log_step("Checking for Accept/Authorize screen")
         _human_pause(page, 400, 900)
         for sel in (
             "input[value='Accept']",
@@ -594,6 +609,7 @@ def _obtain_tokens() -> dict:
         _fail_if_etrade_authorize_error(page, browser)
 
         # ── Verifier: URL param (callback) or page scrape ─────────────────
+        _log_step("Searching for oauth_verifier in URL or page")
         verifier = _verifier_from_url(page.url)
 
         if not verifier:
@@ -652,6 +668,7 @@ def _obtain_tokens() -> dict:
 
     print(f"Verifier code obtained: {verifier[:2]}***")
 
+    _log_step("Exchanging verifier for access tokens")
     tokens = oauth.get_access_token(verifier)
     print("Access tokens obtained successfully.")
     return tokens
@@ -670,11 +687,13 @@ def main() -> int:
 
     import psycopg
 
+    _log_step("Starting token refresh run")
     tokens = _obtain_tokens()
     tok = tokens["oauth_token"]
     sec = tokens["oauth_token_secret"]
 
     dsn = _prepare_psycopg_dsn(database_url)
+    _log_step("Writing refreshed tokens to Postgres")
     with psycopg.connect(dsn) as conn:
         _ensure_sessions_table(conn)
         sid = _upsert_session(conn, tok, sec)
