@@ -23,8 +23,14 @@ name: Watchlist scan → Postgres
 on:
   workflow_dispatch:
   schedule:
-    # Every 30 minutes UTC (edit as needed)
-    - cron: "*/30 * * * *"
+    # US equity RTH in Central: 8:30–15:00 (8:30 AM first run, 3:00 PM last), every 30 min, Mon–Fri.
+    # (GitHub cron + IANA tz; does not skip exchange holidays.)
+    - cron: "30 8 * * 1-5"
+      timezone: "America/Chicago"
+    - cron: "0,30 9-14 * * 1-5"
+      timezone: "America/Chicago"
+    - cron: "0 15 * * 1-5"
+      timezone: "America/Chicago"
 
 jobs:
   sync:
