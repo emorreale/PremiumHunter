@@ -1,5 +1,8 @@
 pyetrade==2.1.1
 psycopg[binary]>=3.2,<4
+# scripts/etrade_token_refresh.py — after pip install: playwright install chromium
+playwright>=1.48
+pyotp>=2.9,<3
 streamlit==1.56.0
 pandas==3.0.2
 python-dotenv==1.2.2

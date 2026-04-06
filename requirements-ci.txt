@@ -1,9 +1,7 @@
-# Deps for scripts/etrade_token_refresh.py + scripts/watchlist_snapshot_to_postgres.py (GitHub Actions).
+# Deps for scripts/watchlist_snapshot_to_postgres.py (GitHub Actions). Token refresh runs elsewhere.
 pyetrade==2.1.1
 python-dotenv==1.2.2
 psycopg[binary]>=3.2,<4
 numpy>=1.26,<3
 pandas>=2.2,<4
 yfinance>=0.2,<2
-playwright>=1.48
-pyotp>=2.9,<3

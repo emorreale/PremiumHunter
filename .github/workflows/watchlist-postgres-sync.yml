@@ -1,24 +1,17 @@
 # Scan E*Trade option chains for watchlist tickers, compute Wheel Alpha,
-# and write to PostgreSQL: etrade_sessions, options_scans.
+# and write to PostgreSQL: options_scans (reads OAuth tokens from etrade_sessions).
+#
+# Refresh tokens out-of-band (e.g. scripts/etrade_token_refresh.py on your machine or PythonAnywhere).
 #
 # Required repository secrets:
 #   DATABASE_URL              — postgresql://... (Supabase: prefer pooler URI for CI; password must be URL-encoded)
-#   ETRADE_CONSUMER_KEY       — same as local .env
+#   ETRADE_CONSUMER_KEY
 #   ETRADE_CONSUMER_SECRET
-#   ETRADE_USERNAME           — E*Trade login username
-#   ETRADE_PASSWORD           — E*Trade login password
 #   ETRADE_SANDBOX            — exactly "true" or "false"
 #   WATCHLIST_JSON            — optional if watchlists has at least one row (scan merges all owners); else e.g. ["AAPL","NVDA"]
 #
 # Optional secrets:
-#   ETRADE_TOTP_SECRET        — base32 TOTP secret for 2FA (omit if no 2FA)
 #   DATABASE_IPV4             — explicit IPv4 for hostaddr if DB DNS is IPv6-only
-#
-# OAuth refresh (Playwright + login) runs only when:
-#   • workflow_dispatch (manual), or
-#   • the 8:30 America/Chicago cron (first run of the day).
-# All other scheduled runs only execute the scan; it reuses tokens already in etrade_sessions.
-# If a later run fails with auth errors, run the workflow manually once to refresh.
 #
 name: Watchlist scan → Postgres
 
@@ -51,32 +44,6 @@ jobs:
 
       - name: Install Python dependencies
         run: pip install -r requirements-ci.txt
-
-      - name: Install Playwright browser
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 8 * * 1-5'
-        run: playwright install chromium --with-deps
-
-      - name: Refresh E*Trade OAuth tokens
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 8 * * 1-5'
-        env:
-          DATABASE_FORCE_IPV4: "1"
-          DATABASE_IPV4: ${{ secrets.DATABASE_IPV4 }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          ETRADE_CONSUMER_KEY: ${{ secrets.ETRADE_CONSUMER_KEY }}
-          ETRADE_CONSUMER_SECRET: ${{ secrets.ETRADE_CONSUMER_SECRET }}
-          ETRADE_USERNAME: ${{ secrets.ETRADE_USERNAME }}
-          ETRADE_PASSWORD: ${{ secrets.ETRADE_PASSWORD }}
-          ETRADE_TOTP_SECRET: ${{ secrets.ETRADE_TOTP_SECRET }}
-          ETRADE_SANDBOX: ${{ secrets.ETRADE_SANDBOX }}
-        run: python scripts/etrade_token_refresh.py
-
-      - name: Upload E*Trade login debug screenshot
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: etrade-token-refresh-debug
-          path: etrade_token_debug.png
-          if-no-files-found: ignore
 
       - name: Run watchlist scan + Wheel Alpha
         env:

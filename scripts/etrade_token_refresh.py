@@ -31,6 +31,9 @@ Optional:
   ETRADE_SKIP_COOKIE_WARMUP — set "1" to skip the pre-authorize homepage visit
   ETRADE_HUMAN_DELAYS     — set "0" to skip random short pauses before fills/clicks
   ETRADE_USER_AGENT       — optional full UA string (otherwise a current Chrome desktop UA is used)
+  ETRADE_LOCATOR_TIMEOUT_MS — max wait per selector when probing fields (default 2200; was 8000 and
+                            multiplied by iframe count × selector count)
+  ETRADE_FRAMES_FIRST      — set "1" to try child iframes before the main document (legacy order)
 
 GitHub Actions often cannot complete login if E*Trade shows CAPTCHA or blocks datacenter IPs;
 use workflow_dispatch from a trusted network or refresh tokens from your machine if needed.
@@ -85,6 +88,13 @@ def _human_pause(root, lo_ms: int = 160, hi_ms: int = 620) -> None:
         getattr(root, "page", root).wait_for_timeout(random.randint(lo_ms, hi_ms))
     except Exception:
         pass
+
+
+def _locator_visible_timeout_ms() -> int:
+    raw = (os.environ.get("ETRADE_LOCATOR_TIMEOUT_MS") or "").strip()
+    if raw.isdigit():
+        return max(400, min(20000, int(raw)))
+    return 2200
 
 
 def _debug_png_path() -> Path:
@@ -218,20 +228,28 @@ def _warmup_etrade_origin(page, auth_url: str) -> None:
 
 
 def _login_roots(page):
-    """Child frames first (OAuth often embeds the form), then main frame."""
+    """Main document first unless ETRADE_FRAMES_FIRST=1 (E*Trade login is usually full-page)."""
+    frames_first = (os.environ.get("ETRADE_FRAMES_FIRST") or "").strip().lower() in ("1", "true", "yes")
+    if frames_first:
+        for fr in page.frames:
+            if fr != page.main_frame:
+                yield fr
+        yield page
+        return
+    yield page
     for fr in page.frames:
         if fr != page.main_frame:
             yield fr
-    yield page
 
 
 def _fill_first_visible(root, selectors: tuple[str, ...], value: str) -> bool:
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
+    vis_ms = _locator_visible_timeout_ms()
     for sel in selectors:
         loc = root.locator(sel).first
         try:
-            loc.wait_for(state="visible", timeout=8000)
+            loc.wait_for(state="visible", timeout=vis_ms)
             _human_pause(root)
             loc.fill(value, timeout=5000)
             return True
@@ -250,10 +268,11 @@ def _fill_first_visible_tree(page, selectors: tuple[str, ...], value: str) -> bo
 def _click_first_visible(root, selectors: tuple[str, ...]) -> bool:
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
+    vis_ms = _locator_visible_timeout_ms()
     for sel in selectors:
         loc = root.locator(sel).first
         try:
-            loc.wait_for(state="visible", timeout=5000)
+            loc.wait_for(state="visible", timeout=vis_ms)
             _human_pause(root)
             loc.click(timeout=5000)
             return True
