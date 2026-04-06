@@ -3,6 +3,7 @@
 #
 # Required repository secrets:
 #   DATABASE_URL              — postgresql://... (use SSL params if your host requires it)
+#   DATABASE_IPV4             — optional; if the DB hostname has no A record, set explicit IPv4
 #   ETRADE_CONSUMER_KEY       — same as local .env
 #   ETRADE_CONSUMER_SECRET
 #   ETRADE_OAUTH_TOKEN        — access token (oauth_token from .etrade_tokens.json)
@@ -11,6 +12,9 @@
 #   WATCHLIST_JSON            — e.g. ["AAPL","NVDA","VXX"]  (repo file is gitignored locally)
 #
 # E*Trade tokens expire; refresh them locally and update secrets when quotes start failing.
+#
+# GitHub-hosted runners often cannot reach databases over IPv6. If DATABASE_URL resolves to
+# IPv6 first, set DATABASE_FORCE_IPV4 below (or put the DB host’s IPv4 in secret DATABASE_IPV4).
 #
 name: Watchlist scan → Postgres
 
@@ -41,6 +45,8 @@ jobs:
 
       - name: Run watchlist scan + Wheel Alpha
         env:
+          DATABASE_FORCE_IPV4: "1"
+          DATABASE_IPV4: ${{ secrets.DATABASE_IPV4 }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ETRADE_CONSUMER_KEY: ${{ secrets.ETRADE_CONSUMER_KEY }}
           ETRADE_CONSUMER_SECRET: ${{ secrets.ETRADE_CONSUMER_SECRET }}

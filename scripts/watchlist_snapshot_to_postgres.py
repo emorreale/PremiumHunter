@@ -18,6 +18,9 @@ Required env:
 
 Optional:
   WATCHLIST_FILE        — path to JSON file; overrides WATCHLIST_JSON
+  DATABASE_FORCE_IPV4   — if "1"/"true"/"yes", resolve DB host to IPv4 and set libpq hostaddr
+                          (GitHub-hosted runners often cannot reach IPv6-only / AAAA-first hosts)
+  DATABASE_IPV4         — explicit IPv4 for hostaddr (overrides DATABASE_FORCE_IPV4 resolution)
 """
 from __future__ import annotations
 
@@ -25,9 +28,11 @@ import datetime as dt
 import json
 import math
 import os
+import socket
 import sys
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
 
@@ -247,6 +252,26 @@ def _insert_scan_and_result(
     )
 
 
+def _psycopg_connect_kwargs(database_url: str) -> dict:
+    """Optional hostaddr so CI can use IPv4 when DNS prefers unreachable IPv6 (e.g. GitHub Actions)."""
+    explicit = (os.environ.get("DATABASE_IPV4") or "").strip()
+    if explicit:
+        return {"hostaddr": explicit}
+    flag = (os.environ.get("DATABASE_FORCE_IPV4") or "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return {}
+    host = urlparse(database_url).hostname
+    if not host:
+        return {}
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return {}
+    if not infos:
+        return {}
+    return {"hostaddr": infos[0][4][0]}
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -281,7 +306,7 @@ def main() -> int:
         print("Install psycopg: pip install 'psycopg[binary]'", file=sys.stderr)
         return 1
 
-    with psycopg.connect(database_url) as conn:
+    with psycopg.connect(database_url, **_psycopg_connect_kwargs(database_url)) as conn:
         _ensure_tables(conn)
         _upsert_session(conn, tok, sec)
 
