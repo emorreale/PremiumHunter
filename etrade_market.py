@@ -135,16 +135,21 @@ def _option_side(pair: dict, side: str):
     return _first(pair, "Put", "put", "optionPut", "optionput")
 
 
-def _option_iv(option: dict):
+def _option_greek(option: dict, greek_key: str, *alt_keys: str):
     if not isinstance(option, dict):
         return 0
     g = _first(option, "OptionGreeks", "optionGreeks")
     if isinstance(g, dict):
-        v = _first(g, "iv", "IV")
-        if v is not None and v != "":
-            return v
-    v = option.get("iv")
+        for k in (greek_key, *alt_keys):
+            v = g.get(k)
+            if v is not None and v != "":
+                return v
+    v = option.get(greek_key)
     return v if v is not None else 0
+
+
+def _option_iv(option: dict):
+    return _option_greek(option, "iv", "IV")
 
 
 def _option_pairs(resp: dict) -> list:
@@ -191,6 +196,7 @@ def get_option_chain(
                 "Volume": option.get("volume", option.get("Volume", 0)),
                 "Open Interest": _first(option, "openInterest", "OpenInterest") or 0,
                 "IV": _option_iv(option),
+                "Gamma": _option_greek(option, "gamma", "Gamma"),
                 "In The Money": option.get("inTheMoney", option.get("InTheMoney", "")),
             })
 
