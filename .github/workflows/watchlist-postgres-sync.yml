@@ -1,5 +1,5 @@
 # Scan E*Trade option chains for watchlist tickers, compute Wheel Alpha,
-# and write to PostgreSQL: etrade_sessions, options_scans, wheel_alpha_results.
+# and write to PostgreSQL: etrade_sessions, options_scans.
 #
 # Required repository secrets:
 #   DATABASE_URL              — postgresql://... (Supabase: prefer pooler URI for CI; password must be URL-encoded)

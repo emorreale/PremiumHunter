@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Scan E*Trade option chains for watchlist tickers, compute Wheel Alpha,
-and persist results to three PostgreSQL tables:
+and persist results to PostgreSQL:
 
-  etrade_sessions      — current access tokens (upserted)
-  options_scans        — one row per scanned strike/expiry
-  wheel_alpha_results  — computed alpha linked to each scan row
+  etrade_sessions — current access tokens (upserted)
+  options_scans   — one row per contract; wheel_alpha matches Discover (0–100, gamma tax inside score)
 
 Designed for GitHub Actions (no Streamlit).
 
@@ -56,8 +55,8 @@ PH_WHEEL_DTE_GAMMA_POWER = 3.0
 PH_GAMMA_TAX_YIELD_REF_PCT = 10.0
 PH_GAMMA_TAX_MULT_MIN = 0.5
 PH_GAMMA_TAX_MULT_MAX = 1.0
-PH_MATRIX_MAX_EXPIRIES = 5
-PH_MATRIX_MIN_MO_RETURN_PCT = 3.0
+PH_SYNC_MAX_EXPIRY_DAYS = 45
+PH_SYNC_MIN_MO_YIELD_PCT = 2.0
 
 
 # ── Wheel Alpha helpers (mirror of 2_Analyzer.py, no Streamlit) ─────────────
@@ -131,12 +130,12 @@ def _gamma_tax_multiplier(mo_return_pct: float, calendar_dte: int) -> float:
 def _calculate_wheel_alpha(
     mo_return_pct, otm_pct, calendar_dte, iv_dec, iv_rank, strike,
     *, cost_basis=None, is_put=True,
-) -> tuple[float, float, float]:
-    """Returns (base_score, gamma_tax_mult, final_alpha)."""
+) -> float:
+    """Same formula and order as Discover `_calculate_wheel_alpha`: 0–100 with gamma tax in-score."""
     if (not is_put) and cost_basis and strike < cost_basis:
-        return (0.0, 1.0, 0.0)
+        return 0.0
     if iv_dec is None or iv_dec <= 0:
-        return (float("nan"), float("nan"), float("nan"))
+        return float("nan")
     net_monthly_yield = mo_return_pct - (4.5 / 12.0 if is_put else 0.0)
     exp1 = float(iv_dec * np.sqrt(max(int(calendar_dte), 1) / 365.0) * 100.0)
     safety_factor = (abs(float(otm_pct)) / max(exp1, 0.01)) ** 2
@@ -147,10 +146,8 @@ def _calculate_wheel_alpha(
     dw = _dte_weight(calendar_dte)
     score = (net_monthly_yield * safety_factor * dw) / vol_penalty
     score *= _income_scaling_factor(float(mo_return_pct))
-    base = float(score * 10.0)
-    gt = _gamma_tax_multiplier(float(mo_return_pct), calendar_dte)
-    final = float(np.clip(base * gt, 0.0, 100.0))
-    return (base, gt, final)
+    score *= _gamma_tax_multiplier(float(mo_return_pct), calendar_dte)
+    return float(np.clip(score * 10.0, 0.0, 100.0))
 
 
 # ── Loaders ─────────────────────────────────────────────────────────────────
@@ -181,6 +178,11 @@ def _load_symbols() -> list[str]:
 
 
 # ── DB helpers ──────────────────────────────────────────────────────────────
+# Postgres: wall time America/Chicago, second precision (matches schema defaults).
+_SQL_TS_CHICAGO_SEC = (
+    "(date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)"
+)
+
 
 def _ensure_tables(conn) -> None:
     schema_sql = (Path(__file__).resolve().parent / "schema_watchlist_snapshots.sql").read_text()
@@ -203,15 +205,15 @@ def _upsert_session(conn, token: str, secret: str) -> int:
         row = cur.fetchone()
         if row:
             cur.execute(
-                "UPDATE etrade_sessions SET last_renewed = NOW() WHERE id = %s",
+                f"UPDATE etrade_sessions SET last_renewed = {_SQL_TS_CHICAGO_SEC} WHERE id = %s",
                 (row[0],),
             )
             conn.commit()
             return row[0]
         cur.execute(
-            """
+            f"""
             INSERT INTO etrade_sessions (access_token, access_token_secret, last_renewed)
-            VALUES (%s, %s, NOW()) RETURNING id
+            VALUES (%s, %s, {_SQL_TS_CHICAGO_SEC}) RETURNING id
             """,
             (token, secret),
         )
@@ -220,10 +222,11 @@ def _upsert_session(conn, token: str, secret: str) -> int:
     return sid
 
 
-def _insert_scan_and_result(
+def _insert_scan_row(
     cur,
     *,
     symbol: str,
+    strategy: str,
     strike: float,
     expiry: dt.date,
     dte: int,
@@ -232,26 +235,29 @@ def _insert_scan_and_result(
     iv: float | None,
     iv_rank_val: float | None,
     gamma_val: float | None,
-    base_score: float,
-    gamma_tax: float,
-    final_alpha: float,
+    wheel_alpha: float,
 ) -> None:
     scan_id = str(uuid.uuid4())
     cur.execute(
         """
         INSERT INTO options_scans
-            (scan_id, symbol, strike, expiry, dte, otm_pct, mo_yield, iv, iv_rank, gamma)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (scan_id, symbol, strategy, strike, expiry, dte, otm_pct, mo_yield, iv, iv_rank, gamma, wheel_alpha)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
-        (scan_id, symbol, strike, expiry, dte, otm_pct, mo_yield, iv, iv_rank_val, gamma_val),
-    )
-    cur.execute(
-        """
-        INSERT INTO wheel_alpha_results
-            (scan_id, base_score, gamma_tax_applied, final_alpha_score)
-        VALUES (%s, %s, %s, %s)
-        """,
-        (scan_id, base_score, gamma_tax, final_alpha),
+        (
+            scan_id,
+            symbol,
+            strategy,
+            strike,
+            expiry,
+            dte,
+            otm_pct,
+            mo_yield,
+            iv,
+            iv_rank_val,
+            gamma_val,
+            wheel_alpha,
+        ),
     )
 
 
@@ -360,11 +366,10 @@ def main() -> int:
                 if y and m and d:
                     expiries.append(dt.date(y, m, d))
             expiries.sort()
-            cutoff = today + dt.timedelta(days=60)
+            cutoff = today + dt.timedelta(days=PH_SYNC_MAX_EXPIRY_DAYS)
             selected = sorted(d for d in expiries if today < d <= cutoff)
             if not selected:
                 selected = sorted(d for d in expiries if d > today)[:2]
-            selected = selected[:PH_MATRIX_MAX_EXPIRIES]
 
             iv_lo, iv_hi = _iv_rank_bounds(sym)
 
@@ -372,6 +377,15 @@ def main() -> int:
                 for exp_date in selected:
                     calendar_dte = (exp_date - today).days
                     if calendar_dte <= 0:
+                        continue
+                    raw_bus = int(
+                        np.busday_count(
+                            np.datetime64(today),
+                            np.datetime64(exp_date),
+                        )
+                    )
+                    trading_dte = raw_bus + 1 if exp_date > today else raw_bus
+                    if trading_dte <= 0:
                         continue
                     for chain_type, is_put in (("PUT", True), ("CALL", False)):
                         try:
@@ -386,14 +400,15 @@ def main() -> int:
                             strike = float(row.get("Strike", 0) or 0)
                             if strike <= 0 or bid <= 0:
                                 continue
-                            otm_pct = ((strike / spot) - 1.0) * 100.0
+                            # Same as Discover: OTM puts → strike below spot (negative %); OTM calls → positive %.
+                            otm_pct = ((strike / spot) - 1.0) * 100.0 if spot > 0 else 0.0
                             if is_put and otm_pct >= 0:
                                 continue
                             if (not is_put) and otm_pct <= 0:
                                 continue
                             raw_return = bid / strike if is_put else bid / spot
                             mo_yield = raw_return * (PH_AVG_CALENDAR_DAYS_PER_MONTH / calendar_dte) * 100.0
-                            if mo_yield <= PH_MATRIX_MIN_MO_RETURN_PCT:
+                            if mo_yield <= PH_SYNC_MIN_MO_YIELD_PCT:
                                 continue
                             iv_dec = _scan_iv_to_decimal(row.get("IV"))
                             iv_rank_val = _iv_rank_pct(iv_dec, iv_lo, iv_hi)
@@ -402,33 +417,33 @@ def main() -> int:
                                 gamma_val = float(gamma_raw) if gamma_raw else None
                             except (TypeError, ValueError):
                                 gamma_val = None
-                            base, gt, final = _calculate_wheel_alpha(
+                            wa = _calculate_wheel_alpha(
                                 mo_yield, otm_pct, calendar_dte, iv_dec, iv_rank_val, strike,
                                 cost_basis=spot if not is_put else None,
                                 is_put=is_put,
                             )
-                            if not (final == final and np.isfinite(final)):
+                            if not (wa == wa and np.isfinite(wa)):
                                 continue
-                            _insert_scan_and_result(
+                            strat = "cash_secured_put" if is_put else "covered_call"
+                            _insert_scan_row(
                                 cur,
                                 symbol=sym,
+                                strategy=strat,
                                 strike=strike,
                                 expiry=exp_date,
-                                dte=calendar_dte,
+                                dte=trading_dte,
                                 otm_pct=round(otm_pct, 4),
                                 mo_yield=round(mo_yield, 4),
                                 iv=round(float(iv_dec), 6) if iv_dec is not None else None,
                                 iv_rank_val=round(float(iv_rank_val), 2) if iv_rank_val is not None else None,
                                 gamma_val=round(float(gamma_val), 6) if gamma_val is not None else None,
-                                base_score=round(base, 4),
-                                gamma_tax=round(gt, 4),
-                                final_alpha=round(final, 2),
+                                wheel_alpha=round(float(wa), 2),
                             )
                             total_rows += 1
             conn.commit()
             print(f"  {sym}: committed rows so far: {total_rows}")
 
-    print(f"Done. Inserted {total_rows} scan+result row(s) for {', '.join(symbols)}.")
+    print(f"Done. Inserted {total_rows} options_scans row(s) for {', '.join(symbols)}.")
     return 0
 
 
