@@ -3,9 +3,8 @@
 Scan E*Trade option chains for watchlist tickers, compute Wheel Alpha,
 and persist results to PostgreSQL:
 
-  etrade_sessions — current access tokens (upserted)
-  options_scans   — one row per contract; math uses America/Chicago calendar date, Discover-parity
-                    rounding; IV column = raw chain value (not IV decimal used inside Wheel Alpha)
+  etrade_sessions — access tokens (upserted); PK column session_id
+  options_scans   — one row per contract, FK session_id → etrade_sessions (same job’s session)
 
 Designed for GitHub Actions (no Streamlit).
 
@@ -114,6 +113,56 @@ def _iv_rank_bounds(symbol: str) -> tuple[float | None, float | None]:
     return (None, None) if hi - lo < 1e-9 else (lo, hi)
 
 
+def _next_earnings_date(symbol: str, ref_day: dt.date) -> dt.date | None:
+    """Next earnings on/after ref_day (US/Eastern calendar); same sources as Discover `_cached_next_earnings_date_str`."""
+    import pandas as pd
+    import yfinance as yf
+
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+    try:
+        tk = yf.Ticker(sym)
+        cal = tk.calendar
+        if isinstance(cal, dict):
+            eds = cal.get("Earnings Date")
+            if eds is not None and eds != "":
+                if not isinstance(eds, (list, tuple)):
+                    eds = [eds]
+                for d in eds:
+                    if isinstance(d, dt.datetime):
+                        d = d.date()
+                    elif isinstance(d, pd.Timestamp):
+                        d = d.date()
+                    if isinstance(d, dt.date) and d >= ref_day:
+                        return d
+        edf = tk.get_earnings_dates(limit=20)
+        if edf is not None and not edf.empty:
+            for ts in sorted(edf.index):
+                tsn = pd.Timestamp(ts)
+                d = (
+                    tsn.tz_convert("America/New_York").date()
+                    if tsn.tzinfo is not None
+                    else tsn.date()
+                )
+                if d >= ref_day:
+                    return d
+        inf = tk.info or {}
+        ts = (
+            inf.get("earningsTimestamp")
+            or inf.get("earningsTimestampStart")
+            or inf.get("earningsTimestampEnd")
+        )
+        if ts is not None:
+            tsn = pd.Timestamp(int(ts), unit="s", tz="UTC").tz_convert("America/New_York")
+            d = tsn.date()
+            if d >= ref_day:
+                return d
+    except Exception:
+        pass
+    return None
+
+
 def _iv_rank_pct(iv_dec, lo, hi):
     if iv_dec is None or lo is None or hi is None:
         return None
@@ -212,11 +261,11 @@ def _ensure_tables(conn) -> None:
 
 
 def _upsert_session(conn, token: str, secret: str) -> int:
-    """Insert or update session row; return its id."""
+    """Insert or update session row; return session_id."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id FROM etrade_sessions
+            SELECT session_id FROM etrade_sessions
             WHERE access_token = %s AND access_token_secret = %s
             ORDER BY last_renewed DESC LIMIT 1
             """,
@@ -225,7 +274,7 @@ def _upsert_session(conn, token: str, secret: str) -> int:
         row = cur.fetchone()
         if row:
             cur.execute(
-                f"UPDATE etrade_sessions SET last_renewed = {_SQL_TS_CHICAGO_SEC} WHERE id = %s",
+                f"UPDATE etrade_sessions SET last_renewed = {_SQL_TS_CHICAGO_SEC} WHERE session_id = %s",
                 (row[0],),
             )
             conn.commit()
@@ -233,7 +282,7 @@ def _upsert_session(conn, token: str, secret: str) -> int:
         cur.execute(
             f"""
             INSERT INTO etrade_sessions (access_token, access_token_secret, last_renewed)
-            VALUES (%s, %s, {_SQL_TS_CHICAGO_SEC}) RETURNING id
+            VALUES (%s, %s, {_SQL_TS_CHICAGO_SEC}) RETURNING session_id
             """,
             (token, secret),
         )
@@ -245,15 +294,18 @@ def _upsert_session(conn, token: str, secret: str) -> int:
 def _insert_scan_row(
     cur,
     *,
+    session_id: int,
     symbol: str,
     strategy: str,
     strike: float,
+    underlying_price: float,
     expiry: dt.date,
     dte: int,
     otm_pct: float,
     mo_yield: float,
     iv: float | None,
     iv_rank_val: float | None,
+    earn_date: dt.date | None,
     gamma_val: float | None,
     wheel_alpha: float,
 ) -> None:
@@ -261,20 +313,24 @@ def _insert_scan_row(
     cur.execute(
         """
         INSERT INTO options_scans
-            (scan_id, symbol, strategy, strike, expiry, dte, otm_pct, mo_yield, iv, iv_rank, gamma, wheel_alpha)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (session_id, scan_id, symbol, strategy, strike, underlying_price, expiry, dte,
+             otm_pct, mo_yield, iv, iv_rank, earn_date, gamma, wheel_alpha)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
+            session_id,
             scan_id,
             symbol,
             strategy,
             strike,
+            underlying_price,
             expiry,
             dte,
             otm_pct,
             mo_yield,
             iv,
             iv_rank_val,
+            earn_date,
             gamma_val,
             wheel_alpha,
         ),
@@ -356,7 +412,7 @@ def main() -> int:
     dsn = _prepare_psycopg_dsn(database_url)
     with psycopg.connect(dsn) as conn:
         _ensure_tables(conn)
-        _upsert_session(conn, tok, sec)
+        session_id = _upsert_session(conn, tok, sec)
 
         total_rows = 0
         today = _scan_date_chicago()
@@ -392,6 +448,7 @@ def main() -> int:
                 selected = sorted(d for d in expiries if d > today)[:2]
 
             iv_lo, iv_hi = _iv_rank_bounds(sym)
+            earn_d = _next_earnings_date(sym, today)
 
             with conn.cursor() as cur:
                 for exp_date in selected:
@@ -448,15 +505,18 @@ def main() -> int:
                             strat = "cash_secured_put" if is_put else "covered_call"
                             _insert_scan_row(
                                 cur,
+                                session_id=session_id,
                                 symbol=sym,
                                 strategy=strat,
                                 strike=strike,
+                                underlying_price=round(spot, 2),
                                 expiry=exp_date,
                                 dte=trading_dte,
                                 otm_pct=round(otm_pct, 2),
                                 mo_yield=round(mo_yield, 2),
                                 iv=round(float(iv_stored), 6) if iv_stored is not None else None,
                                 iv_rank_val=round(float(iv_rank_val), 1) if iv_rank_val is not None else None,
+                                earn_date=earn_d,
                                 gamma_val=round(float(gamma_val), 6) if gamma_val is not None else None,
                                 wheel_alpha=round(float(wa), 1),
                             )
