@@ -50,8 +50,8 @@ def _scanner_calendar_today() -> dt.date:
 
 # ── Cached API wrappers ─────────────────────────────────────────────────────
 
-@st.cache_data(ttl=120, show_spinner=False)
-def _cached_quote(_market_id, symbol: str) -> dict | None:
+def _live_equity_quote(symbol: str) -> dict | None:
+    """E*Trade quote for Discover (spot + scan). Not cached — always fresh per rerun."""
     try:
         q = get_quote(market, symbol)
         if q:
@@ -59,6 +59,7 @@ def _cached_quote(_market_id, symbol: str) -> dict | None:
         return q or None
     except Exception:
         return None
+
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _cached_yf_info(symbol: str) -> dict:
@@ -142,18 +143,6 @@ def _cached_expiry_dates(_market_id, symbol: str) -> list[dt.date]:
         return dates
     except Exception:
         return []
-
-@st.cache_data(ttl=120, show_spinner=False)
-def _cached_option_chain(
-    _market_id, symbol: str, expiry: dt.date, chain_type: str
-) -> pd.DataFrame:
-    try:
-        return get_option_chain(
-            market, symbol, expiry_date=expiry, chain_type=chain_type
-        )
-    except Exception:
-        return pd.DataFrame()
-
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_52w_iv_rank_bounds(symbol: str) -> tuple[float | None, float | None]:
@@ -908,8 +897,7 @@ if not ticker:
     st.warning("Enter a ticker symbol.")
     st.stop()
 
-_mkt_id = id(market)
-quote = _cached_quote(_mkt_id, ticker)
+quote = _live_equity_quote(ticker)
 if not quote:
     st.error(f"No quote returned for {ticker}.")
     st.stop()
@@ -1150,7 +1138,12 @@ _scan_rows: list[dict] = []
 
 with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
     for exp_date in _selected_expiries:
-        chain = _cached_option_chain(id(market), ticker, exp_date, _chain_type)
+        try:
+            chain = get_option_chain(
+                market, ticker, expiry_date=exp_date, chain_type=_chain_type
+            )
+        except Exception:
+            chain = pd.DataFrame()
         if chain.empty:
             continue
 
