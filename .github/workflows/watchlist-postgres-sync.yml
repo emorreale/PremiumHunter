@@ -70,6 +70,14 @@ jobs:
           ETRADE_SANDBOX: ${{ secrets.ETRADE_SANDBOX }}
         run: python scripts/etrade_token_refresh.py
 
+      - name: Upload E*Trade login debug screenshot
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etrade-token-refresh-debug
+          path: etrade_token_debug.png
+          if-no-files-found: ignore
+
       - name: Run watchlist scan + Wheel Alpha
         env:
           DATABASE_FORCE_IPV4: "1"

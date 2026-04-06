@@ -35,6 +35,7 @@ import os
 import re
 import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -45,6 +46,31 @@ if str(_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 load_dotenv(_ROOT / ".env")
+
+
+def _debug_png_path() -> Path:
+    """CI: GITHUB_WORKSPACE so upload-artifact can collect; else OS temp dir."""
+    ws = (os.environ.get("GITHUB_WORKSPACE") or "").strip()
+    if ws:
+        return Path(ws) / "etrade_token_debug.png"
+    return Path(tempfile.gettempdir()) / "etrade_token_debug.png"
+
+
+def _fail_browser(page, browser, *lines: str) -> None:
+    path = _debug_png_path()
+    try:
+        page.screenshot(path=str(path), full_page=True)
+    except Exception:
+        pass
+    try:
+        browser.close()
+    except Exception:
+        pass
+    for line in lines:
+        print(line, file=sys.stderr)
+    print(f"Debug screenshot: {path}", file=sys.stderr)
+    sys.exit(1)
+
 
 _SQL_TS_CHICAGO_SEC = (
     "(date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)"
@@ -132,11 +158,19 @@ def _verifier_from_url(url: str) -> str | None:
     return None
 
 
-def _fill_first_visible(page, selectors: tuple[str, ...], value: str) -> bool:
+def _login_roots(page):
+    """Main document plus child frames (E*Trade often embeds the form in an iframe)."""
+    yield page
+    for fr in page.frames:
+        if fr != page.main_frame:
+            yield fr
+
+
+def _fill_first_visible(root, selectors: tuple[str, ...], value: str) -> bool:
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
     for sel in selectors:
-        loc = page.locator(sel).first
+        loc = root.locator(sel).first
         try:
             loc.wait_for(state="visible", timeout=8000)
             loc.fill(value, timeout=5000)
@@ -146,11 +180,18 @@ def _fill_first_visible(page, selectors: tuple[str, ...], value: str) -> bool:
     return False
 
 
-def _click_first_visible(page, selectors: tuple[str, ...]) -> bool:
+def _fill_first_visible_tree(page, selectors: tuple[str, ...], value: str) -> bool:
+    for root in _login_roots(page):
+        if _fill_first_visible(root, selectors, value):
+            return True
+    return False
+
+
+def _click_first_visible(root, selectors: tuple[str, ...]) -> bool:
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
     for sel in selectors:
-        loc = page.locator(sel).first
+        loc = root.locator(sel).first
         try:
             loc.wait_for(state="visible", timeout=5000)
             loc.click(timeout=5000)
@@ -158,6 +199,31 @@ def _click_first_visible(page, selectors: tuple[str, ...]) -> bool:
         except PlaywrightTimeout:
             continue
     return False
+
+
+def _click_first_visible_tree(page, selectors: tuple[str, ...]) -> bool:
+    for root in _login_roots(page):
+        if _click_first_visible(root, selectors):
+            return True
+    return False
+
+
+def _print_login_diagnostics(page, totp_secret: str) -> None:
+    if not (totp_secret or "").strip():
+        print(
+            "HINT: ETRADE_TOTP_SECRET is unset. If E*Trade requires 2FA, add the base32 secret "
+            "to GitHub Actions secrets or login will stay on the security step.",
+            file=sys.stderr,
+        )
+    for sel in ("[role='alert']", ".error", ".message-error", ".alert-danger", ".alert", "#errorText"):
+        try:
+            loc = page.locator(sel).first
+            if loc.count():
+                t = loc.inner_text(timeout=2000).strip()
+                if t:
+                    print(f"On-page text ({sel}): {t[:900]}", file=sys.stderr)
+        except Exception:
+            continue
 
 
 def _obtain_tokens() -> dict:
@@ -181,22 +247,40 @@ def _obtain_tokens() -> dict:
     auth_url = oauth.get_request_token()
     print(f"Authorization URL obtained (sandbox={is_sandbox})")
 
+    if sys.platform == "win32":
+        _ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+    else:
+        _ua = (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
+        browser = pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+            ],
+        )
         context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            user_agent=_ua,
             viewport={"width": 1280, "height": 900},
+            locale="en-US",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
         page = context.new_page()
-        # networkidle often never settles on E*Trade (analytics/long-poll).
         page.goto(auth_url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(3000)
 
-        # ── Login ────────────────────────────────────────────────────────
+        # ── Login (main page + iframes) ──────────────────────────────────
         user_selectors = (
             "input[name='USER']",
             "#user_orig",
@@ -222,47 +306,49 @@ def _obtain_tokens() -> dict:
             "input[type='submit']",
         )
 
-        if not _fill_first_visible(page, user_selectors, username):
-            page.screenshot(path="/tmp/etrade_token_debug.png")
-            browser.close()
-            print(
-                "ERROR: Could not find username field (E*Trade may have changed the login page).",
-                file=sys.stderr,
+        if not _fill_first_visible_tree(page, user_selectors, username):
+            _fail_browser(
+                page,
+                browser,
+                "ERROR: Could not find username field (try iframe or E*Trade UI change).",
+                f"Page URL: {page.url}",
             )
-            print("Screenshot: /tmp/etrade_token_debug.png URL:", page.url, file=sys.stderr)
-            sys.exit(1)
-        if not _fill_first_visible(page, pass_selectors, password):
-            page.screenshot(path="/tmp/etrade_token_debug.png")
-            browser.close()
-            print("ERROR: Could not find password field.", file=sys.stderr)
-            sys.exit(1)
+        if not _fill_first_visible_tree(page, pass_selectors, password):
+            _fail_browser(page, browser, "ERROR: Could not find password field.", f"Page URL: {page.url}")
 
         prev_url = page.url
-        if not _click_first_visible(page, logon_selectors):
-            page.screenshot(path="/tmp/etrade_token_debug.png")
-            browser.close()
-            print("ERROR: Could not find Log On / submit control.", file=sys.stderr)
-            sys.exit(1)
+        if not _click_first_visible_tree(page, logon_selectors):
+            _fail_browser(page, browser, "ERROR: Could not find Log On / submit control.", f"Page URL: {page.url}")
 
-        deadline = time.time() + 45.0
-        while time.time() < deadline:
-            u = page.url
-            if u != prev_url and "/etx/pxy/login" not in u:
-                break
-            page.wait_for_timeout(500)
+        def _wait_off_login_screen(timeout_s: float) -> None:
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                if "/etx/pxy/login" not in page.url:
+                    return
+                page.wait_for_timeout(400)
+
+        _wait_off_login_screen(12.0)
+        if "/etx/pxy/login" in page.url:
+            try:
+                page.keyboard.press("Enter")
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+            _wait_off_login_screen(25.0)
+
         page.wait_for_load_state("domcontentloaded")
         page.wait_for_timeout(2000)
 
         if "/etx/pxy/login" in page.url or page.url == prev_url:
-            page.screenshot(path="/tmp/etrade_token_debug.png")
-            browser.close()
-            print(
-                "ERROR: Still on E*Trade login — wrong password, extra step (CAPTCHA/security), "
-                "or UI changed. Check secrets and screenshot.",
-                file=sys.stderr,
+            _print_login_diagnostics(page, totp_secret)
+            _fail_browser(
+                page,
+                browser,
+                "ERROR: Still on E*Trade login — wrong GitHub secrets, CAPTCHA/bot block on datacenter IP, "
+                "missing 2FA secret, or UI changed. Download the workflow artifact "
+                "`etrade-token-refresh-debug` (screenshot).",
+                f"Page URL: {page.url}",
             )
-            print("Page URL:", page.url, file=sys.stderr)
-            sys.exit(1)
 
         # ── 2FA / TOTP ──────────────────────────────────────────────────
         if totp_secret:
@@ -285,8 +371,8 @@ def _obtain_tokens() -> dict:
                 "input[value='Submit']",
                 "button[type='submit']",
             )
-            if _fill_first_visible(page, otp_selectors, totp.now()):
-                _click_first_visible(page, otp_submit)
+            if _fill_first_visible_tree(page, otp_selectors, totp.now()):
+                _click_first_visible_tree(page, otp_submit)
                 page.wait_for_load_state("domcontentloaded")
                 page.wait_for_timeout(2500)
 
@@ -357,13 +443,12 @@ def _obtain_tokens() -> dict:
                         break
 
         if not verifier:
-            page.screenshot(path="/tmp/etrade_token_debug.png")
-            final_url = page.url
-            browser.close()
-            print("ERROR: Could not find verifier code on the page.", file=sys.stderr)
-            print("A debug screenshot was saved to /tmp/etrade_token_debug.png", file=sys.stderr)
-            print("Page URL:", final_url, file=sys.stderr)
-            sys.exit(1)
+            _fail_browser(
+                page,
+                browser,
+                "ERROR: Could not find verifier code on the page.",
+                f"Page URL: {page.url}",
+            )
 
         browser.close()
 
