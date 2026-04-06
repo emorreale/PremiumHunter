@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
+from zoneinfo import ZoneInfo
 
 from etrade_market import (
     get_equity_display_price,
@@ -41,6 +42,12 @@ PH_WHEEL_DTE_GAMMA_POWER = 3.0  # >2 steeper than (DTE/5)²; 1DTE → 0.008 vs 0
 PH_GAMMA_TAX_YIELD_REF_PCT = 10.0
 PH_GAMMA_TAX_MULT_MIN = 0.5
 PH_GAMMA_TAX_MULT_MAX = 1.0
+
+
+def _scanner_calendar_today() -> dt.date:
+    """Central calendar date for DTE / Mo. Return (same as GitHub watchlist sync)."""
+    return dt.datetime.now(ZoneInfo("America/Chicago")).date()
+
 
 # ── Cached API wrappers ─────────────────────────────────────────────────────
 
@@ -1149,7 +1156,7 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
         if chain.empty:
             continue
 
-        _today = dt.date.today()
+        _today = _scanner_calendar_today()
         # busday_count excludes the start date but includes the end date, so it does
         # not count "today" as a session. When expiration is after today, add 1 so DTE
         # is trading days from today through expiration, inclusive (Mon–Fri; NumPy

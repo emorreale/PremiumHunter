@@ -4,7 +4,8 @@ Scan E*Trade option chains for watchlist tickers, compute Wheel Alpha,
 and persist results to PostgreSQL:
 
   etrade_sessions — current access tokens (upserted)
-  options_scans   — one row per contract; wheel_alpha matches Discover (0–100, gamma tax inside score)
+  options_scans   — one row per contract; math uses America/Chicago calendar date, Discover-parity
+                    rounding; IV column = raw chain value (not IV decimal used inside Wheel Alpha)
 
 Designed for GitHub Actions (no Streamlit).
 
@@ -35,6 +36,7 @@ import socket
 import sys
 import uuid
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -57,6 +59,24 @@ PH_GAMMA_TAX_MULT_MIN = 0.5
 PH_GAMMA_TAX_MULT_MAX = 1.0
 PH_SYNC_MAX_EXPIRY_DAYS = 45
 PH_SYNC_MIN_MO_YIELD_PCT = 2.0
+
+
+def _scan_date_chicago() -> dt.date:
+    """Trading-calendar 'today' for DTE / mo_yield (Discover uses local date; CI runners are UTC)."""
+    return dt.datetime.now(ZoneInfo("America/Chicago")).date()
+
+
+def _iv_chain_numeric(raw) -> float | None:
+    """Raw IV from the chain for DB storage (same scale as Discover’s IV column, not decimalized)."""
+    if raw is None or raw == "":
+        return None
+    try:
+        x = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if x <= 0:
+        return None
+    return x
 
 
 # ── Wheel Alpha helpers (mirror of 2_Analyzer.py, no Streamlit) ─────────────
@@ -339,7 +359,7 @@ def main() -> int:
         _upsert_session(conn, tok, sec)
 
         total_rows = 0
-        today = dt.date.today()
+        today = _scan_date_chicago()
 
         for sym in symbols:
             print(f"Scanning {sym}…")
@@ -411,6 +431,7 @@ def main() -> int:
                             if mo_yield <= PH_SYNC_MIN_MO_YIELD_PCT:
                                 continue
                             iv_dec = _scan_iv_to_decimal(row.get("IV"))
+                            iv_stored = _iv_chain_numeric(row.get("IV"))
                             iv_rank_val = _iv_rank_pct(iv_dec, iv_lo, iv_hi)
                             gamma_raw = row.get("Gamma", 0) or 0
                             try:
@@ -432,12 +453,12 @@ def main() -> int:
                                 strike=strike,
                                 expiry=exp_date,
                                 dte=trading_dte,
-                                otm_pct=round(otm_pct, 4),
-                                mo_yield=round(mo_yield, 4),
-                                iv=round(float(iv_dec), 6) if iv_dec is not None else None,
-                                iv_rank_val=round(float(iv_rank_val), 2) if iv_rank_val is not None else None,
+                                otm_pct=round(otm_pct, 2),
+                                mo_yield=round(mo_yield, 2),
+                                iv=round(float(iv_stored), 6) if iv_stored is not None else None,
+                                iv_rank_val=round(float(iv_rank_val), 1) if iv_rank_val is not None else None,
                                 gamma_val=round(float(gamma_val), 6) if gamma_val is not None else None,
-                                wheel_alpha=round(float(wa), 2),
+                                wheel_alpha=round(float(wa), 1),
                             )
                             total_rows += 1
             conn.commit()
