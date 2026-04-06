@@ -4,7 +4,7 @@ Headless OAuth token refresh for E*Trade via Playwright + pyotp.
 
 Performs the full OAuth 1.0 dance:
   1. Fetch request token from E*Trade API.
-  2. Open the authorization URL in a headless Chromium browser.
+  2. Open the OAuth host root (cookie warm-up), then the authorization URL in headless Chromium.
   3. Log in with username / password.
   4. Handle TOTP 2FA if prompted.
   5. Accept the terms / authorize page.
@@ -28,6 +28,9 @@ Optional:
   DATABASE_FORCE_IPV4     — "1" to force IPv4 (same as watchlist sync)
   DATABASE_IPV4           — explicit IPv4 hostaddr
   PLAYWRIGHT_HEADLESS     — set "false" to show the browser locally while debugging
+  ETRADE_SKIP_COOKIE_WARMUP — set "1" to skip the pre-authorize homepage visit
+  ETRADE_HUMAN_DELAYS     — set "0" to skip random short pauses before fills/clicks
+  ETRADE_USER_AGENT       — optional full UA string (otherwise a current Chrome desktop UA is used)
 
 GitHub Actions often cannot complete login if E*Trade shows CAPTCHA or blocks datacenter IPs;
 use workflow_dispatch from a trusted network or refresh tokens from your machine if needed.
@@ -35,6 +38,7 @@ use workflow_dispatch from a trusted network or refresh tokens from your machine
 from __future__ import annotations
 
 import os
+import random
 import re
 import socket
 import sys
@@ -49,6 +53,38 @@ if str(_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 load_dotenv(_ROOT / ".env")
+
+# Light "stealth": keep UA consistent with Chromium; avoid instant robotic input.
+_STEALTH_INIT_JS = r"""
+(() => {
+  try {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  } catch (e) {}
+  try {
+    if (!window.chrome) {
+      window.chrome = { runtime: {} };
+    }
+  } catch (e) {}
+})();
+"""
+
+
+def _human_delays_enabled() -> bool:
+    return (os.environ.get("ETRADE_HUMAN_DELAYS") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _human_pause(root, lo_ms: int = 160, hi_ms: int = 620) -> None:
+    if not _human_delays_enabled():
+        return
+    try:
+        getattr(root, "page", root).wait_for_timeout(random.randint(lo_ms, hi_ms))
+    except Exception:
+        pass
 
 
 def _debug_png_path() -> Path:
@@ -161,6 +197,26 @@ def _verifier_from_url(url: str) -> str | None:
     return None
 
 
+def _warmup_etrade_origin(page, auth_url: str) -> None:
+    """
+    Load the OAuth host's origin (e.g. https://us.etrade.com/) before the authorize URL so the
+    browser can receive first-party cookies some flows expect. Harmless if it does nothing.
+    """
+    from urllib.parse import urlparse
+
+    if (os.environ.get("ETRADE_SKIP_COOKIE_WARMUP") or "").strip().lower() in ("1", "true", "yes"):
+        return
+    try:
+        parsed = urlparse(auth_url)
+        if not parsed.scheme or not parsed.netloc or "etrade" not in parsed.netloc.lower():
+            return
+        origin = f"{parsed.scheme}://{parsed.netloc}/"
+        page.goto(origin, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(random.randint(2000, 3800) if _human_delays_enabled() else 2500)
+    except Exception:
+        pass
+
+
 def _login_roots(page):
     """Child frames first (OAuth often embeds the form), then main frame."""
     for fr in page.frames:
@@ -176,6 +232,7 @@ def _fill_first_visible(root, selectors: tuple[str, ...], value: str) -> bool:
         loc = root.locator(sel).first
         try:
             loc.wait_for(state="visible", timeout=8000)
+            _human_pause(root)
             loc.fill(value, timeout=5000)
             return True
         except PlaywrightTimeout:
@@ -197,6 +254,7 @@ def _click_first_visible(root, selectors: tuple[str, ...]) -> bool:
         loc = root.locator(sel).first
         try:
             loc.wait_for(state="visible", timeout=5000)
+            _human_pause(root)
             loc.click(timeout=5000)
             return True
         except PlaywrightTimeout:
@@ -218,6 +276,7 @@ def _check_use_security_code_checkbox(root) -> None:
         if cb.count():
             first = cb.first
             if first.is_visible() and not first.is_checked():
+                _human_pause(root, 200, 550)
                 first.check(timeout=5000)
                 return
     except Exception:
@@ -225,6 +284,7 @@ def _check_use_security_code_checkbox(root) -> None:
     try:
         lab = root.locator("label").filter(has_text=re.compile(r"use\s+security\s+code", re.I)).first
         if lab.count() and lab.is_visible():
+            _human_pause(root, 200, 550)
             lab.click(timeout=5000)
     except Exception:
         pass
@@ -250,11 +310,41 @@ def _try_login_one_root(
         return False
     if (totp_secret or "").strip():
         _check_use_security_code_checkbox(root)
-        getattr(root, "page", root).wait_for_timeout(900)
+        _gap = random.randint(700, 1400) if _human_delays_enabled() else 900
+        getattr(root, "page", root).wait_for_timeout(_gap)
         import pyotp
 
         _fill_first_visible(root, otp_selectors, pyotp.TOTP(totp_secret.strip()).now())
     return _click_first_visible(root, logon_selectors)
+
+
+def _etrade_authorize_hard_fail_hint(page) -> str | None:
+    """
+    E*Trade sometimes returns a minimal authorize page with only a yellow banner, e.g.
+    'Due to a logon delay or other issue, your authentication could not be completed...'
+    (no verifier). Return a short explanation for stderr, or None.
+    """
+    try:
+        text = page.locator("body").inner_text(timeout=10000).lower()
+    except Exception:
+        try:
+            text = (page.content() or "").lower()
+        except Exception:
+            return None
+    if "authentication could not be completed" in text or "logon delay or other issue" in text:
+        return (
+            "E*Trade showed an authorize-page failure (often transient load-balancer / session timing). "
+            "There is no oauth_verifier to scrape. Re-run the job; if it keeps failing from GitHub Actions, "
+            "run workflow_dispatch from a trusted network or refresh tokens locally — datacenter IPs are "
+            "often throttled."
+        )
+    return None
+
+
+def _fail_if_etrade_authorize_error(page, browser) -> None:
+    hint = _etrade_authorize_hard_fail_hint(page)
+    if hint:
+        _fail_browser(page, browser, f"ERROR: {hint}", f"Page URL: {page.url}")
 
 
 def _print_login_diagnostics(page, totp_secret: str) -> None:
@@ -296,38 +386,50 @@ def _obtain_tokens() -> dict:
     auth_url = oauth.get_request_token()
     print(f"Authorization URL obtained (sandbox={is_sandbox})")
 
-    if sys.platform == "win32":
-        _ua = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        )
-    else:
-        _ua = (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        )
+    _ua = (os.environ.get("ETRADE_USER_AGENT") or "").strip()
+    if not _ua:
+        if sys.platform == "win32":
+            _ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+            )
+        else:
+            _ua = (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+            )
+
+    _launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--window-size=1920,1080",
+    ]
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-            ],
-        )
+        try:
+            browser = pw.chromium.launch(
+                headless=headless,
+                args=_launch_args,
+                ignore_default_args=["--enable-automation"],
+            )
+        except TypeError:
+            browser = pw.chromium.launch(headless=headless, args=_launch_args)
         context = browser.new_context(
             user_agent=_ua,
-            viewport={"width": 1280, "height": 900},
+            viewport={"width": 1920, "height": 1080},
             locale="en-US",
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            timezone_id="America/Chicago",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Upgrade-Insecure-Requests": "1",
+            },
         )
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
+        context.add_init_script(_STEALTH_INIT_JS)
         page = context.new_page()
+        _warmup_etrade_origin(page, auth_url)
         page.goto(auth_url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(random.randint(2200, 4200) if _human_delays_enabled() else 3000)
 
         # ── Login (same frame for user+pass; VIP = check "Use security code" + TOTP before Log on)
         user_selectors = (
@@ -416,6 +518,8 @@ def _obtain_tokens() -> dict:
         page.wait_for_load_state("domcontentloaded")
         page.wait_for_timeout(2000)
 
+        _fail_if_etrade_authorize_error(page, browser)
+
         if "/etx/pxy/login" in page.url or page.url == prev_url:
             _print_login_diagnostics(page, totp_secret)
             _fail_browser(
@@ -445,6 +549,7 @@ def _obtain_tokens() -> dict:
                 page.wait_for_timeout(2500)
 
         # ── Accept / Authorize ───────────────────────────────────────────
+        _human_pause(page, 400, 900)
         for sel in (
             "input[value='Accept']",
             "button:has-text('Accept')",
@@ -457,12 +562,17 @@ def _obtain_tokens() -> dict:
             loc = page.locator(sel)
             if loc.count():
                 try:
+                    _human_pause(page, 250, 700)
                     loc.first.click(timeout=5000)
                     page.wait_for_load_state("domcontentloaded")
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(
+                        random.randint(1700, 2600) if _human_delays_enabled() else 2000
+                    )
                 except Exception:
                     pass
                 break
+
+        _fail_if_etrade_authorize_error(page, browser)
 
         # ── Verifier: URL param (callback) or page scrape ─────────────────
         verifier = _verifier_from_url(page.url)
@@ -511,6 +621,7 @@ def _obtain_tokens() -> dict:
                         break
 
         if not verifier:
+            _fail_if_etrade_authorize_error(page, browser)
             _fail_browser(
                 page,
                 browser,
