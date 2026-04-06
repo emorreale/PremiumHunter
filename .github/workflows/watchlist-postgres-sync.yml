@@ -16,8 +16,8 @@
 #
 # OAuth refresh (Playwright + login) runs only when:
 #   • workflow_dispatch (manual), or
-#   • the 8:30 America/Chicago cron (first run of the day).
-# All other scheduled runs only execute the scan; it reuses tokens already in etrade_sessions.
+#   • the 8:00 America/Chicago cron (first run of the day).
+# All other scheduled runs (8:30–15:00 every 30 min) only execute the scan; reuse etrade_sessions tokens.
 # If a later run fails with auth errors, run the workflow manually once to refresh.
 #
 name: Watchlist scan → Postgres
@@ -25,7 +25,9 @@ name: Watchlist scan → Postgres
 on:
   workflow_dispatch:
   schedule:
-    # US equity RTH in Central: 8:30–15:00 (8:30 AM first run, 3:00 PM last), every 30 min, Mon–Fri.
+    # US equity RTH in Central: 8:00–15:00 every 30 min Mon–Fri. Token refresh only at 8:00.
+    - cron: "0 8 * * 1-5"
+      timezone: "America/Chicago"
     - cron: "30 8 * * 1-5"
       timezone: "America/Chicago"
     - cron: "0,30 9-14 * * 1-5"
@@ -53,11 +55,11 @@ jobs:
         run: pip install -r requirements-ci.txt
 
       - name: Install Playwright browser
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 8 * * 1-5'
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * 1-5'
         run: playwright install chromium --with-deps
 
       - name: Refresh E*Trade OAuth tokens
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 8 * * 1-5'
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * 1-5'
         env:
           DATABASE_FORCE_IPV4: "1"
           DATABASE_IPV4: ${{ secrets.DATABASE_IPV4 }}
