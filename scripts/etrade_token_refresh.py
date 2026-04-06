@@ -24,10 +24,15 @@ Optional:
   ETRADE_TOTP_SECRET      — base32 TOTP secret for 2FA (skip if account has no 2FA)
   DATABASE_FORCE_IPV4     — "1" to force IPv4 (same as watchlist sync)
   DATABASE_IPV4           — explicit IPv4 hostaddr
+  PLAYWRIGHT_HEADLESS     — set "false" to show the browser locally while debugging
+
+GitHub Actions often cannot complete login if E*Trade shows CAPTCHA or blocks datacenter IPs;
+use workflow_dispatch from a trusted network or refresh tokens from your machine if needed.
 """
 from __future__ import annotations
 
 import os
+import re
 import socket
 import sys
 import time
@@ -112,6 +117,49 @@ def _upsert_session(conn, token: str, secret: str) -> int:
     return sid
 
 
+def _verifier_from_url(url: str) -> str | None:
+    """Callback-style redirect includes oauth_verifier=…"""
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    parsed = urlparse(url)
+    for key in ("oauth_verifier", "verifier"):
+        q = parse_qs(parsed.query)
+        if key in q and q[key][0]:
+            return unquote(q[key][0]).strip()
+    if "oauth_verifier=" in url:
+        part = url.split("oauth_verifier=", 1)[1].split("&")[0]
+        return unquote(part).strip() or None
+    return None
+
+
+def _fill_first_visible(page, selectors: tuple[str, ...], value: str) -> bool:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    for sel in selectors:
+        loc = page.locator(sel).first
+        try:
+            loc.wait_for(state="visible", timeout=8000)
+            loc.fill(value, timeout=5000)
+            return True
+        except PlaywrightTimeout:
+            continue
+    return False
+
+
+def _click_first_visible(page, selectors: tuple[str, ...]) -> bool:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    for sel in selectors:
+        loc = page.locator(sel).first
+        try:
+            loc.wait_for(state="visible", timeout=5000)
+            loc.click(timeout=5000)
+            return True
+        except PlaywrightTimeout:
+            continue
+    return False
+
+
 def _obtain_tokens() -> dict:
     """Full headless OAuth flow; returns {"oauth_token": ..., "oauth_token_secret": ...}."""
     import pyetrade
@@ -123,93 +171,188 @@ def _obtain_tokens() -> dict:
     password = os.environ["ETRADE_PASSWORD"]
     is_sandbox = os.environ.get("ETRADE_SANDBOX", "true").lower() == "true"
     totp_secret = (os.environ.get("ETRADE_TOTP_SECRET") or "").strip()
+    headless = os.environ.get("PLAYWRIGHT_HEADLESS", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
     oauth = pyetrade.ETradeOAuth(consumer_key, consumer_secret)
     auth_url = oauth.get_request_token()
     print(f"Authorization URL obtained (sandbox={is_sandbox})")
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(headless=headless)
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/131.0.0.0 Safari/537.36"
             ),
+            viewport={"width": 1280, "height": 900},
         )
         page = context.new_page()
-        page.goto(auth_url, wait_until="networkidle")
+        # networkidle often never settles on E*Trade (analytics/long-poll).
+        page.goto(auth_url, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(2500)
 
         # ── Login ────────────────────────────────────────────────────────
-        # E*Trade uses input[name='USER'] and input[name='PASSWORD'] on the
-        # OAuth authorize page. The logon button has id #logon_button or is
-        # the submit named "Logon". We try multiple selectors for resilience.
-        for sel in ("input[name='USER']", "#user_orig"):
-            if page.locator(sel).count():
-                page.locator(sel).fill(username)
-                break
+        user_selectors = (
+            "input[name='USER']",
+            "#user_orig",
+            "#userId",
+            "input#userId",
+            "input[name='userId']",
+            "input[id*='user' i][type='text']",
+            "input[autocomplete='username']",
+        )
+        pass_selectors = (
+            "input[name='PASSWORD']",
+            "#txtPassword",
+            "input[type='password']",
+            "input[autocomplete='current-password']",
+        )
+        logon_selectors = (
+            "#logon_button",
+            "input[value='Logon']",
+            "input[type='submit'][value*='Log' i]",
+            "button:has-text('Log On')",
+            "button:has-text('Log on')",
+            "button[type='submit']",
+            "input[type='submit']",
+        )
 
-        for sel in ("input[name='PASSWORD']", "#txtPassword"):
-            if page.locator(sel).count():
-                page.locator(sel).fill(password)
-                break
+        if not _fill_first_visible(page, user_selectors, username):
+            page.screenshot(path="/tmp/etrade_token_debug.png")
+            browser.close()
+            print(
+                "ERROR: Could not find username field (E*Trade may have changed the login page).",
+                file=sys.stderr,
+            )
+            print("Screenshot: /tmp/etrade_token_debug.png URL:", page.url, file=sys.stderr)
+            sys.exit(1)
+        if not _fill_first_visible(page, pass_selectors, password):
+            page.screenshot(path="/tmp/etrade_token_debug.png")
+            browser.close()
+            print("ERROR: Could not find password field.", file=sys.stderr)
+            sys.exit(1)
 
-        for sel in ("#logon_button", "input[value='Logon']", "button:has-text('Log On')"):
-            loc = page.locator(sel)
-            if loc.count():
-                loc.click()
-                break
+        prev_url = page.url
+        if not _click_first_visible(page, logon_selectors):
+            page.screenshot(path="/tmp/etrade_token_debug.png")
+            browser.close()
+            print("ERROR: Could not find Log On / submit control.", file=sys.stderr)
+            sys.exit(1)
 
-        page.wait_for_load_state("networkidle")
-        time.sleep(2)
+        deadline = time.time() + 45.0
+        while time.time() < deadline:
+            u = page.url
+            if u != prev_url and "/etx/pxy/login" not in u:
+                break
+            page.wait_for_timeout(500)
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(2000)
+
+        if "/etx/pxy/login" in page.url or page.url == prev_url:
+            page.screenshot(path="/tmp/etrade_token_debug.png")
+            browser.close()
+            print(
+                "ERROR: Still on E*Trade login — wrong password, extra step (CAPTCHA/security), "
+                "or UI changed. Check secrets and screenshot.",
+                file=sys.stderr,
+            )
+            print("Page URL:", page.url, file=sys.stderr)
+            sys.exit(1)
 
         # ── 2FA / TOTP ──────────────────────────────────────────────────
         if totp_secret:
             import pyotp
 
             totp = pyotp.TOTP(totp_secret)
-            for sel in ("#otp_code", "input[name='otp_code']", "input[name='otpCode']",
-                        "input[type='tel']", "input[placeholder*='code' i]"):
-                loc = page.locator(sel)
-                if loc.count():
-                    loc.fill(totp.now())
-                    break
-            for sel in ("#submit_otp", "button:has-text('Submit')", "input[value='Submit']"):
-                loc = page.locator(sel)
-                if loc.count():
-                    loc.click()
-                    break
-            page.wait_for_load_state("networkidle")
-            time.sleep(2)
+            otp_selectors = (
+                "#otp_code",
+                "input[name='otp_code']",
+                "input[name='otpCode']",
+                "input[name='securityCode']",
+                "input[inputmode='numeric']",
+                "input[type='tel']",
+                "input[placeholder*='code' i]",
+            )
+            otp_submit = (
+                "#submit_otp",
+                "button:has-text('Submit')",
+                "button:has-text('Continue')",
+                "input[value='Submit']",
+                "button[type='submit']",
+            )
+            if _fill_first_visible(page, otp_selectors, totp.now()):
+                _click_first_visible(page, otp_submit)
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(2500)
 
-        # ── Accept terms ─────────────────────────────────────────────────
-        for sel in ("input[value='Accept']", "button:has-text('Accept')", "#continueButton"):
+        # ── Accept / Authorize ───────────────────────────────────────────
+        for sel in (
+            "input[value='Accept']",
+            "button:has-text('Accept')",
+            "button:has-text('Approve')",
+            "button:has-text('Allow')",
+            "#continueButton",
+            "input[value='Continue']",
+            "button:has-text('Continue')",
+        ):
             loc = page.locator(sel)
             if loc.count():
-                loc.click()
-                page.wait_for_load_state("networkidle")
-                time.sleep(2)
+                try:
+                    loc.first.click(timeout=5000)
+                    page.wait_for_load_state("domcontentloaded")
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
                 break
 
-        # ── Scrape verifier code ─────────────────────────────────────────
-        verifier = None
+        # ── Verifier: URL param (callback) or page scrape ─────────────────
+        verifier = _verifier_from_url(page.url)
 
-        # Most common: a text input holding the 5-6 digit verifier
-        for sel in ("div > input[type='text']", "input[type='text']"):
-            loc = page.locator(sel)
-            if loc.count():
-                val = (loc.first.input_value() or "").strip()
-                if val and val.isalnum():
-                    verifier = val
+        if not verifier:
+            for sel in (
+                "input[readonly][type='text']",
+                "input[type='text'][readonly]",
+                "div > input[type='text']",
+                "input[type='text']",
+            ):
+                loc = page.locator(sel)
+                n = loc.count()
+                for i in range(min(n, 12)):
+                    try:
+                        val = (loc.nth(i).input_value() or "").strip()
+                        if 4 <= len(val) <= 32 and re.fullmatch(r"[A-Za-z0-9]+", val):
+                            verifier = val
+                            break
+                    except Exception:
+                        continue
+                if verifier:
                     break
 
-        # Fallback: look for a prominent text element with only digits/letters
+        if not verifier:
+            body = page.content()
+            m = re.search(
+                r"oauth_verifier=([A-Za-z0-9._~-]+)",
+                body,
+                re.I,
+            ) or re.search(
+                r"(?:verification|verifier)\s*(?:code)?[:\s]+([A-Za-z0-9]{4,32})",
+                body,
+                re.I,
+            )
+            if m:
+                verifier = m.group(1).strip()
+
         if not verifier:
             for sel in (".verifier-code", "#verifier", "code", "pre"):
                 loc = page.locator(sel)
                 if loc.count():
                     val = (loc.first.inner_text() or "").strip()
-                    if val and val.isalnum() and len(val) <= 10:
+                    if val and val.isalnum() and len(val) <= 32:
                         verifier = val
                         break
 
