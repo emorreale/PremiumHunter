@@ -52,6 +52,7 @@ if str(_ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 
+from ph_wheel_calendar_dte import wheel_alpha_effective_calendar_dte
 from watchlist_db import normalize_watchlist_symbols
 
 load_dotenv(_ROOT / ".env")
@@ -65,6 +66,7 @@ PH_WHEEL_DTE_GAMMA_POWER = 3.0
 PH_GAMMA_TAX_YIELD_REF_PCT = 20.0
 PH_GAMMA_TAX_MULT_MIN = 0.5
 PH_GAMMA_TAX_MULT_MAX = 1.0
+PH_WHEEL_OTM_SAFETY_STD = 0.75  # must match Discover / 2_Analyzer
 PH_SYNC_MAX_EXPIRY_DAYS = 45
 PH_SYNC_MIN_MO_YIELD_PCT = 2.0
 
@@ -72,6 +74,27 @@ PH_SYNC_MIN_MO_YIELD_PCT = 2.0
 def _scan_date_chicago() -> dt.date:
     """Trading-calendar 'today' for DTE / mo_yield (Discover uses local date; CI runners are UTC)."""
     return dt.datetime.now(ZoneInfo("America/Chicago")).date()
+
+
+def _trading_dte_anchor_chicago() -> dt.date:
+    """Start date for stored trading DTE only (mirrors Discover `_scanner_trading_dte_anchor_date`)."""
+    chi = ZoneInfo("America/Chicago")
+    now = dt.datetime.now(chi)
+    d = now.date()
+    wd = d.weekday()
+    is_weekend = wd >= 5
+    close_et = dt.datetime.combine(
+        d, dt.time(16, 0), tzinfo=ZoneInfo("America/New_York")
+    )
+    close_chi = close_et.astimezone(chi)
+    past_close = (not is_weekend) and (now >= close_chi)
+    if is_weekend:
+        nxt = np.busday_offset(np.datetime64(d), 0, roll="forward")
+    elif past_close:
+        nxt = np.busday_offset(np.datetime64(d), 1)
+    else:
+        return d
+    return dt.date.fromisoformat(str(nxt))
 
 
 def _iv_chain_numeric(raw) -> float | None:
@@ -192,14 +215,14 @@ def _income_scaling_factor(mo_return_pct: float) -> float:
     return float((mo_return_pct - lo) / (hi - lo))
 
 
-def _dte_weight(calendar_dte: int) -> float:
-    d = max(int(calendar_dte), 0)
+def _dte_weight(calendar_dte: float) -> float:
+    d = max(float(calendar_dte), 0.0)
     t = float(PH_WHEEL_DTE_TARGET_DAYS)
     return 1.0 if d >= t else float((d / t) ** PH_WHEEL_DTE_GAMMA_POWER)
 
 
-def _gamma_tax_multiplier(mo_return_pct: float, calendar_dte: int) -> float:
-    dte_cal = max(int(calendar_dte), 1)
+def _gamma_tax_multiplier(mo_return_pct: float, calendar_dte: float) -> float:
+    dte_cal = max(float(calendar_dte), 1e-9)
     grf = float(np.sqrt(1.0 / dte_cal))
     gt = (float(mo_return_pct) / PH_GAMMA_TAX_YIELD_REF_PCT) / grf
     return float(np.clip(gt, PH_GAMMA_TAX_MULT_MIN, PH_GAMMA_TAX_MULT_MAX))
@@ -215,8 +238,9 @@ def _calculate_wheel_alpha(
     if iv_dec is None or iv_dec <= 0:
         return float("nan")
     net_monthly_yield = mo_return_pct - (4.5 / 12.0 if is_put else 0.0)
-    exp1 = float(iv_dec * np.sqrt(max(int(calendar_dte), 1) / 365.0) * 100.0)
-    safety_factor = (abs(float(otm_pct)) / max(exp1, 0.01)) ** 2
+    exp1 = float(iv_dec * np.sqrt(max(float(calendar_dte), 1e-9) / 365.0) * 100.0)
+    tgt = max(exp1 * PH_WHEEL_OTM_SAFETY_STD, 0.01)
+    safety_factor = (abs(float(otm_pct)) / tgt) ** 2
     ir = float(iv_rank) if iv_rank is not None and not (isinstance(iv_rank, float) and math.isnan(iv_rank)) else 50.0
     vol_penalty = (iv_dec ** 0.9) * (1.0 + (100.0 - ir) / 100.0)
     if vol_penalty <= 0 or not np.isfinite(vol_penalty):
@@ -473,6 +497,7 @@ def main() -> int:
 
         total_rows = 0
         today = _scan_date_chicago()
+        dte_anchor = _trading_dte_anchor_chicago()
 
         for sym in symbols:
             print(f"Scanning {sym}…")
@@ -509,16 +534,16 @@ def main() -> int:
 
             with conn.cursor() as cur:
                 for exp_date in selected:
-                    calendar_dte = (exp_date - today).days
+                    calendar_dte = wheel_alpha_effective_calendar_dte(exp_date)
                     if calendar_dte <= 0:
                         continue
                     raw_bus = int(
                         np.busday_count(
-                            np.datetime64(today),
+                            np.datetime64(dte_anchor),
                             np.datetime64(exp_date),
                         )
                     )
-                    trading_dte = raw_bus + 1 if exp_date > today else raw_bus
+                    trading_dte = raw_bus + 1 if exp_date > dte_anchor else raw_bus
                     if trading_dte <= 0:
                         continue
                     for chain_type, is_put in (("PUT", True), ("CALL", False)):

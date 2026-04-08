@@ -17,6 +17,7 @@ from etrade_market import (
     get_option_chain,
     get_quote,
 )
+from ph_wheel_calendar_dte import wheel_alpha_effective_calendar_dte
 from watchlist_persist import ensure_session_watchlist, save_watchlist
 
 if st.session_state.get("market") is None:
@@ -37,12 +38,13 @@ PH_WHEEL_DTE_GAMMA_POWER = 3.0
 PH_GAMMA_TAX_YIELD_REF_PCT = 20.0
 PH_GAMMA_TAX_MULT_MIN = 0.5
 PH_GAMMA_TAX_MULT_MAX = 1.0
+PH_WHEEL_OTM_SAFETY_STD = 0.75  # must match Discover / watchlist_snapshot_to_postgres
 # Matrix wheel scan: cap E*Trade option-chain calls (CSP puts only — matches Discover default scanner).
 PH_MATRIX_MAX_EXPIRIES = 5
 PH_MATRIX_CSP_SPOT_CACHE_DECIMALS = 4
 # Mo. Return % band: min fixed; max must match Discover PH_SCAN_MO_RETURN_SLIDER_MAX (inclusive).
 PH_MATRIX_MIN_MO_RETURN_PCT = 3.0
-PH_MATRIX_MAX_MO_RETURN_PCT = 30.0
+PH_MATRIX_MAX_MO_RETURN_PCT = 20.0
 # Plain text for hover tooltip on matrix Wheel Alpha gauge (no markdown).
 _PH_MATRIX_GAUGE_TIP = (
     "Wheel Alpha is the mean of the three highest scores from the same CSP scan as "
@@ -258,21 +260,21 @@ def _income_scaling_factor(mo_return_pct: float) -> float:
     return _mo_return_penalty_factor(float(mo_return_pct))
 
 
-def _expected_1sd_move_pct(iv_dec: float, calendar_dte: int) -> float:
-    dte = max(int(calendar_dte), 1)
+def _expected_1sd_move_pct(iv_dec: float, calendar_dte: float) -> float:
+    dte = max(float(calendar_dte), 1e-9)
     return float(iv_dec * np.sqrt(dte / 365.0) * 100.0)
 
 
-def _dte_weight(calendar_dte: int) -> float:
-    d = max(int(calendar_dte), 0)
+def _dte_weight(calendar_dte: float) -> float:
+    d = max(float(calendar_dte), 0.0)
     t = float(PH_WHEEL_DTE_TARGET_DAYS)
     if d >= t:
         return 1.0
     return float((d / t) ** PH_WHEEL_DTE_GAMMA_POWER)
 
 
-def _gamma_tax_multiplier(mo_return_pct: float, calendar_dte: int) -> float:
-    dte_cal = max(int(calendar_dte), 1)
+def _gamma_tax_multiplier(mo_return_pct: float, calendar_dte: float) -> float:
+    dte_cal = max(float(calendar_dte), 1e-9)
     gamma_risk_factor = float(np.sqrt(1.0 / dte_cal))
     gamma_tax = (float(mo_return_pct) / PH_GAMMA_TAX_YIELD_REF_PCT) / gamma_risk_factor
     return float(np.clip(gamma_tax, PH_GAMMA_TAX_MULT_MIN, PH_GAMMA_TAX_MULT_MAX))
@@ -288,7 +290,7 @@ def _calculate_wheel_alpha(
         return float("nan")
     net_monthly_yield = mo_return_pct - (4.5 / 12.0 if is_put else 0.0)
     _exp1 = _expected_1sd_move_pct(float(iv_dec), calendar_dte)
-    _tgt = max(_exp1, 0.01)
+    _tgt = max(_exp1 * PH_WHEEL_OTM_SAFETY_STD, 0.01)
     safety_factor = (abs(float(otm_pct)) / _tgt) ** 2
     ir = float(iv_rank) if iv_rank is not None and not (isinstance(iv_rank, float) and np.isnan(iv_rank)) else 50.0
     vol_penalty = (iv_dec ** 0.9) * (1.0 + (100.0 - ir) / 100.0)
@@ -313,7 +315,7 @@ def _top3_weighted_alpha(alphas: list[float]) -> float | None:
 def _matrix_wheel_alphas_from_chain(
     chain: pd.DataFrame,
     spot: float,
-    calendar_dte: int,
+    calendar_dte: float,
     *,
     is_put: bool,
     iv_lo,
@@ -387,7 +389,7 @@ def _matrix_wheel_scan_body(_market_id: int, sym: str, spot: float) -> list[floa
     iv_lo, iv_hi = _cached_52w_iv_rank_bounds(sym)
     alphas: list[float] = []
     for exp_date in selected:
-        calendar_dte = (exp_date - today).days
+        calendar_dte = wheel_alpha_effective_calendar_dte(exp_date)
         if calendar_dte <= 0:
             continue
         put_chain = _cached_option_chain(_market_id, sym, exp_date, "PUT")

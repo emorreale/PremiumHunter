@@ -17,6 +17,7 @@ from etrade_market import (
     get_option_chain,
     get_quote,
 )
+from ph_wheel_calendar_dte import wheel_alpha_effective_calendar_dte
 from watchlist_persist import ensure_session_watchlist, save_watchlist
 
 if st.session_state.get("market") is None:
@@ -27,7 +28,8 @@ market = st.session_state.market
 
 # Plotly price chart height (peer/loser tables use the same pixel height)
 PH_PRICE_CHART_HEIGHT = 400
-# Wheel Alpha safety divisor = expected 1SD % (IV × sqrt(DTE/365) × 100), not a fixed OTM %
+# Wheel Alpha OTM safety: cushion = PH_WHEEL_OTM_SAFETY_STD × expected 1SD % (IV×√(DTE/365)×100).
+PH_WHEEL_OTM_SAFETY_STD = 0.75
 # Monthly return %: (premium / ref) × (avg days per month / calendar DTE) × 100
 PH_AVG_CALENDAR_DAYS_PER_MONTH = 30.42  # ~365.25 / 12
 # Mo. Return % hinge: below hinge = strict linear penalty (0× at ≤2%, →1× at 3%);
@@ -41,13 +43,41 @@ PH_WHEEL_DTE_GAMMA_POWER = 3.0  # >2 steeper than (DTE/5)²; 1DTE → 0.008 vs 0
 PH_GAMMA_TAX_YIELD_REF_PCT = 20.0
 PH_GAMMA_TAX_MULT_MIN = 0.5
 PH_GAMMA_TAX_MULT_MAX = 1.0
-# Options scanner monthly-return slider: default high is 10%; user can drag up to this max.
-PH_SCAN_MO_RETURN_SLIDER_MAX = 30.0
+# Options scanner monthly-return slider: 0%–this max; default band is (3%, 10%) until the user moves it.
+PH_SCAN_MO_RETURN_SLIDER_MAX = 20.0
 
 
 def _scanner_calendar_today() -> dt.date:
     """Central calendar date for DTE / Mo. Return (same as GitHub watchlist sync)."""
     return dt.datetime.now(ZoneInfo("America/Chicago")).date()
+
+
+def _scanner_trading_dte_anchor_date() -> dt.date:
+    """Start date for DTE (Trading Days) only — Mon–Fri session count (numpy; no holidays).
+
+    After US equity RTH close (4:00 PM Eastern) on a weekday, or on Sat/Sun (Chicago
+    calendar), the next session is used so a late-evening scan does not still count
+    'today' as a full trading day. Calendar DTE, Mo. Return %, and Wheel Alpha still
+    use `_scanner_calendar_today()` for the date; Mo. Return % and Wheel Alpha use
+    `wheel_alpha_effective_calendar_dte` so today's slab decays toward Chicago midnight.
+    """
+    chi = ZoneInfo("America/Chicago")
+    now = dt.datetime.now(chi)
+    d = now.date()
+    wd = d.weekday()
+    is_weekend = wd >= 5
+    close_et = dt.datetime.combine(
+        d, dt.time(16, 0), tzinfo=ZoneInfo("America/New_York")
+    )
+    close_chi = close_et.astimezone(chi)
+    past_close = (not is_weekend) and (now >= close_chi)
+    if is_weekend:
+        nxt = np.busday_offset(np.datetime64(d), 0, roll="forward")
+    elif past_close:
+        nxt = np.busday_offset(np.datetime64(d), 1)
+    else:
+        return d
+    return dt.date.fromisoformat(str(nxt))
 
 
 # ── Cached API wrappers ─────────────────────────────────────────────────────
@@ -224,30 +254,30 @@ def _income_scaling_factor(mo_return_pct: float) -> float:
     return _mo_return_penalty_factor(float(mo_return_pct))
 
 
-def _expected_1sd_move_pct(iv_dec: float, calendar_dte: int) -> float:
+def _expected_1sd_move_pct(iv_dec: float, calendar_dte: float) -> float:
     """
     Expected one-standard-deviation move (%), annualized IV in decimal:
     IV × sqrt(calendar DTE / 365) × 100.
     """
-    dte = max(int(calendar_dte), 1)
+    dte = max(float(calendar_dte), 1e-9)
     return float(iv_dec * np.sqrt(dte / 365.0) * 100.0)
 
 
-def _dte_weight(calendar_dte: int) -> float:
+def _dte_weight(calendar_dte: float) -> float:
     """(DTE/target)^power below target calendar DTE; 1.0 at/above target (gamma-style short-DTE penalty)."""
-    d = max(int(calendar_dte), 0)
+    d = max(float(calendar_dte), 0.0)
     t = float(PH_WHEEL_DTE_TARGET_DAYS)
     if d >= t:
         return 1.0
     return float((d / t) ** PH_WHEEL_DTE_GAMMA_POWER)
 
 
-def _gamma_tax_multiplier(mo_return_pct: float, calendar_dte: int) -> float:
+def _gamma_tax_multiplier(mo_return_pct: float, calendar_dte: float) -> float:
     """
     gamma_risk_factor = sqrt(1 / calendar_DTE); gamma_tax = (mo_return_pct / ref) / that factor.
     Clipped to [min, max] and applied to core alpha so high-yield short DTE can still score well.
     """
-    dte_cal = max(int(calendar_dte), 1)
+    dte_cal = max(float(calendar_dte), 1e-9)
     gamma_risk_factor = float(np.sqrt(1.0 / dte_cal))
     gamma_tax = (float(mo_return_pct) / PH_GAMMA_TAX_YIELD_REF_PCT) / gamma_risk_factor
     return float(np.clip(gamma_tax, PH_GAMMA_TAX_MULT_MIN, PH_GAMMA_TAX_MULT_MAX))
@@ -256,7 +286,7 @@ def _gamma_tax_multiplier(mo_return_pct: float, calendar_dte: int) -> float:
 def _calculate_wheel_alpha(
     mo_return_pct: float,
     otm_pct: float,
-    calendar_dte: int,
+    calendar_dte: float,
     iv_dec: float | None,
     iv_rank: float | None,
     strike: float,
@@ -266,7 +296,8 @@ def _calculate_wheel_alpha(
 ) -> float:
     """
     Wheel Alpha: yield × safety vs vol × time, scaled to 0–100.
-    Safety factor = (|OTM %| / expected 1SD %)² with expected 1SD % = IV×√(DTE/365)×100.
+    calendar_dte is fractional (Chicago: today's slab = time left until midnight / 24h).
+    Safety factor = (|OTM %| / cushion %)²; cushion = PH_WHEEL_OTM_SAFETY_STD × IV×√(DTE/365)×100.
     DTE weight = (calendar DTE / target)^power below target days, else 1; scales yield×safety.
     Mo. Return % below 3%: same linear penalty (0× at ≤2%, →1× at 3%). At/above 3%: log₂-tuned
     factor from 0.60 to 1.0 so higher yields are favored slightly vs heavier log smoothing.
@@ -281,7 +312,7 @@ def _calculate_wheel_alpha(
     net_monthly_yield = mo_return_pct - (4.5 / 12.0 if is_put else 0.0)
 
     _exp1 = _expected_1sd_move_pct(float(iv_dec), calendar_dte)
-    _tgt = max(_exp1, 0.01)
+    _tgt = max(_exp1 * PH_WHEEL_OTM_SAFETY_STD, 0.01)
     _cushion = abs(float(otm_pct))
     safety_factor = (_cushion / _tgt) ** 2
 
@@ -1138,6 +1169,9 @@ _earn_date_str = _cached_next_earnings_date_str(ticker)
 
 _scan_rows: list[dict] = []
 
+_today = _scanner_calendar_today()
+_dte_anchor = _scanner_trading_dte_anchor_date()
+
 with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
     for exp_date in _selected_expiries:
         try:
@@ -1149,22 +1183,21 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
         if chain.empty:
             continue
 
-        _today = _scanner_calendar_today()
-        # busday_count excludes the start date but includes the end date, so it does
-        # not count "today" as a session. When expiration is after today, add 1 so DTE
-        # is trading days from today through expiration, inclusive (Mon–Fri; NumPy
-        # does not apply exchange holidays). Same calendar day → 0 (0DTE).
+        # busday_count excludes the start date; +1 when exp > anchor makes the count
+        # inclusive through expiration (Mon–Fri; NumPy does not apply exchange holidays).
+        # Anchor advances after RTH close / on weekends — trading DTE only. Mo. Return /
+        # Wheel Alpha use wheel_alpha_effective_calendar_dte (today decays to Chicago midnight).
         _raw_dte = int(
             np.busday_count(
-                np.datetime64(_today),
+                np.datetime64(_dte_anchor),
                 np.datetime64(exp_date),
             )
         )
-        dte = _raw_dte + 1 if exp_date > _today else _raw_dte
+        dte = _raw_dte + 1 if exp_date > _dte_anchor else _raw_dte
         if dte <= 0:
             continue
 
-        calendar_dte = (exp_date - _today).days
+        calendar_dte = wheel_alpha_effective_calendar_dte(exp_date)
         if calendar_dte <= 0:
             continue
 
@@ -1253,15 +1286,17 @@ _SCAN_COL_ORDER = (
 _PH_SCAN_COL_HELP: dict[str, str] = {
     "Expiration Date": "Option expiration date (YYYY-MM-DD).",
     "DTE (Trading Days)": (
-        "Trading days from today through expiration, inclusive (Mon–Fri only; "
-        "exchange holidays are not excluded)."
+        "Trading days through expiration, inclusive (Mon–Fri only; exchange holidays "
+        "not excluded). After 4:00 PM US/Eastern on a weekday, or on Sat/Sun (Chicago "
+        "date), counting starts from the next session so the closed session is not included."
     ),
     "Strike": "Strike price for this contract.",
     "OTM %": "Moneyness vs spot: negative for OTM puts, positive for OTM calls.",
     "Mo. Return %": (
         "(Premium / reference) × (30.42 / calendar days to expiration) × 100. "
         "Puts: reference = strike. Calls: reference = spot. "
-        "Calendar days = expiration date − today (not trading days)."
+        "Effective calendar days = (expiration − Chicago today) with today's slab = hours "
+        "left until Chicago midnight ÷ 24 (not trading days)."
     ),
     "IV": "Implied volatility from the chain (format varies by broker).",
     "IV Rank": (
@@ -1269,8 +1304,9 @@ _PH_SCAN_COL_HELP: dict[str, str] = {
         "52w range uses trailing min/max of 30-day historical vol (annualized) as an IV proxy."
     ),
     "Wheel Alpha": (
-        "Yield × safety vs IV × time (0–100). Safety factor = (|OTM %| / expected 1SD %)² "
-        "with expected 1SD % = IV × √(calendar DTE / 365) × 100 (IV annualized as decimal). "
+        "Yield × safety vs IV × time (0–100). Safety = (|OTM %| / cushion %)² with "
+        f"cushion = {PH_WHEEL_OTM_SAFETY_STD:g} × IV × √(effective calendar DTE / 365) × 100 "
+        "(IV as decimal; effective DTE = Mo. Return tooltip). "
         f"DTE weight = (calendar DTE / {PH_WHEEL_DTE_TARGET_DAYS})^"
         f"{PH_WHEEL_DTE_GAMMA_POWER:g} below {PH_WHEEL_DTE_TARGET_DAYS} days, else 1. "
         f"Gamma tax × clip((Mo. Return % / {PH_GAMMA_TAX_YIELD_REF_PCT:g}) / √(1/calendar DTE), "
