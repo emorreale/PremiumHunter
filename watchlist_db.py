@@ -115,20 +115,44 @@ def ensure_watchlists_table_minimal(conn) -> None:
 
 def _canonical_watchlist_owner(cur, owner: str) -> str:
     """
-    Map app owner to the watchlists.owner primary key. streamlit-authenticator stores
-    usernames lowercased, while older rows may be mixed case (e.g. Evan vs evan).
+    Map app owner to the watchlists.owner primary key. streamlit-authenticator lowercases
+    usernames; legacy rows may differ in case. Postgres PKs are case-sensitive, so both
+    'evan' and 'Evan' can exist — prefer the row with the most symbols, then newest
+    updated_at, so an empty duplicate row does not shadow the real one.
     """
     o = (owner or "default").strip() or "default"
-    cur.execute("SELECT owner FROM watchlists WHERE owner = %s", (o,))
-    r = cur.fetchone()
-    if r:
-        return str(r[0])
     cur.execute(
-        "SELECT owner FROM watchlists WHERE lower(owner) = lower(%s) LIMIT 1",
+        """
+        SELECT owner, symbols, updated_at
+        FROM watchlists
+        WHERE lower(owner) = lower(%s)
+        """,
         (o,),
     )
-    r = cur.fetchone()
-    return str(r[0]) if r else o
+    rows = cur.fetchall()
+    if not rows:
+        return o
+
+    def _score(row: tuple) -> tuple:
+        _ow, sym, ts = row
+        n = len(normalize_watchlist_symbols(sym))
+        try:
+            tval = float(ts.timestamp()) if ts is not None and hasattr(ts, "timestamp") else 0.0
+        except Exception:
+            tval = 0.0
+        return (n, tval)
+
+    best = max(rows, key=_score)
+    chosen = str(best[0])
+    if len(rows) > 1:
+        _LOG.warning(
+            "Multiple watchlists rows for login %r: %s — using %r (%d symbol(s))",
+            o,
+            [str(r[0]) for r in rows],
+            chosen,
+            _score(best)[0],
+        )
+    return chosen
 
 
 def sync_watchlist_to_postgres(symbols: list[str], *, owner: str | None = None) -> None:
