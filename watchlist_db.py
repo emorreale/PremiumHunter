@@ -113,6 +113,24 @@ def ensure_watchlists_table_minimal(conn) -> None:
     conn.commit()
 
 
+def _canonical_watchlist_owner(cur, owner: str) -> str:
+    """
+    Map app owner to the watchlists.owner primary key. streamlit-authenticator stores
+    usernames lowercased, while older rows may be mixed case (e.g. Evan vs evan).
+    """
+    o = (owner or "default").strip() or "default"
+    cur.execute("SELECT owner FROM watchlists WHERE owner = %s", (o,))
+    r = cur.fetchone()
+    if r:
+        return str(r[0])
+    cur.execute(
+        "SELECT owner FROM watchlists WHERE lower(owner) = lower(%s) LIMIT 1",
+        (o,),
+    )
+    r = cur.fetchone()
+    return str(r[0]) if r else o
+
+
 def sync_watchlist_to_postgres(symbols: list[str], *, owner: str | None = None) -> None:
     """Upsert watchlists row. No-op if DATABASE_URL is unset. Raises on DB errors."""
     ensure_watchlist_logging()
@@ -149,10 +167,14 @@ def sync_watchlist_to_postgres(symbols: list[str], *, owner: str | None = None) 
         return
 
     dsn = prepare_psycopg_dsn(database_url)
+    resolved_owner = o
     try:
         with psycopg.connect(dsn) as conn:
             ensure_watchlists_table_minimal(conn)
             with conn.cursor() as cur:
+                resolved_owner = _canonical_watchlist_owner(cur, o)
+                if resolved_owner != o:
+                    _LOG.info("Owner %r resolved to existing row PK %r", o, resolved_owner)
                 cur.execute(
                     """
                     INSERT INTO watchlists (owner, symbols, updated_at)
@@ -165,7 +187,7 @@ def sync_watchlist_to_postgres(symbols: list[str], *, owner: str | None = None) 
                         symbols = EXCLUDED.symbols,
                         updated_at = EXCLUDED.updated_at
                     """,
-                    (o, Json(symbols)),
+                    (resolved_owner, Json(symbols)),
                 )
             conn.commit()
     except Exception:
@@ -177,7 +199,7 @@ def sync_watchlist_to_postgres(symbols: list[str], *, owner: str | None = None) 
 
     _LOG.info(
         "Sync OK — watchlists row owner=%r updated with %d symbol(s)",
-        o,
+        resolved_owner,
         len(symbols),
     )
 
@@ -212,9 +234,12 @@ def fetch_watchlist_from_postgres(*, owner: str | None = None) -> list[str] | No
         with psycopg.connect(dsn) as conn:
             ensure_watchlists_table_minimal(conn)
             with conn.cursor() as cur:
+                co = _canonical_watchlist_owner(cur, o)
+                if co != o:
+                    _LOG.info("Fetch owner %r matched row PK %r", o, co)
                 cur.execute(
                     "SELECT symbols FROM watchlists WHERE owner = %s",
-                    (o,),
+                    (co,),
                 )
                 row = cur.fetchone()
     except Exception:
@@ -225,10 +250,10 @@ def fetch_watchlist_from_postgres(*, owner: str | None = None) -> list[str] | No
         return None
 
     if not row:
-        _LOG.info("Fetch OK — no row for owner=%r", o)
+        _LOG.info("Fetch OK — no row for owner=%r (canonical %r)", o, co)
         return []
 
     raw = row[0]
     out = normalize_watchlist_symbols(raw)
-    _LOG.info("Fetch OK — owner=%r count=%d", o, len(out))
+    _LOG.info("Fetch OK — owner=%r count=%d", co, len(out))
     return out
