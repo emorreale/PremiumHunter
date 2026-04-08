@@ -180,3 +180,55 @@ def sync_watchlist_to_postgres(symbols: list[str], *, owner: str | None = None) 
         o,
         len(symbols),
     )
+
+
+def fetch_watchlist_from_postgres(*, owner: str | None = None) -> list[str] | None:
+    """
+    Load symbols for one owner from watchlists. Returns None if DATABASE_URL is unset or
+    the read fails (caller should fall back to local-only). Returns [] if the row is missing
+    or the payload normalizes to empty.
+    """
+    ensure_watchlist_logging()
+
+    database_url = (os.environ.get("DATABASE_URL") or "").strip()
+    if not database_url:
+        return None
+
+    o = (owner or "default").strip() or "default"
+    _LOG.info(
+        "Fetch start owner=%r | %s",
+        o,
+        _describe_database_url(database_url),
+    )
+
+    try:
+        import psycopg
+    except ImportError:
+        _LOG.warning("psycopg not installed — cannot load watchlist from Postgres")
+        return None
+
+    dsn = prepare_psycopg_dsn(database_url)
+    try:
+        with psycopg.connect(dsn) as conn:
+            ensure_watchlists_table_minimal(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT symbols FROM watchlists WHERE owner = %s",
+                    (o,),
+                )
+                row = cur.fetchone()
+    except Exception:
+        _LOG.exception(
+            "watchlists read failed (%s)",
+            _describe_database_url(database_url),
+        )
+        return None
+
+    if not row:
+        _LOG.info("Fetch OK — no row for owner=%r", o)
+        return []
+
+    raw = row[0]
+    out = normalize_watchlist_symbols(raw)
+    _LOG.info("Fetch OK — owner=%r count=%d", o, len(out))
+    return out

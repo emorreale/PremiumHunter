@@ -10,7 +10,11 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
-from watchlist_db import ensure_watchlist_logging, sync_watchlist_to_postgres
+from watchlist_db import (
+    ensure_watchlist_logging,
+    fetch_watchlist_from_postgres,
+    sync_watchlist_to_postgres,
+)
 
 _ROOT = Path(__file__).resolve().parent
 load_dotenv(_ROOT / ".env")
@@ -74,6 +78,10 @@ def load_watchlist_for_owner(owner: str) -> list[str]:
         syms = _parse_watchlist_json(raw)
         if syms or candidate == path:
             return syms
+    # Streamlit Cloud / containers: no persistent project disk — use Postgres (same store as save).
+    db_syms = fetch_watchlist_from_postgres(owner=owner)
+    if db_syms is not None:
+        return db_syms
     return []
 
 
