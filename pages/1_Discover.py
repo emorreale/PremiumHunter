@@ -38,9 +38,11 @@ PH_WHEEL_MO_RETURN_PENALTY_HIGH_PCT = 3.0
 PH_WHEEL_DTE_TARGET_DAYS = 5
 PH_WHEEL_DTE_GAMMA_POWER = 3.0  # >2 steeper than (DTE/5)²; 1DTE → 0.008 vs 0.04 at power 2
 # Gamma tax: reward-to-risk vs short DTE — (mo_return/ref) / sqrt(1/DTE), clipped, scales core score.
-PH_GAMMA_TAX_YIELD_REF_PCT = 10.0
+PH_GAMMA_TAX_YIELD_REF_PCT = 20.0
 PH_GAMMA_TAX_MULT_MIN = 0.5
 PH_GAMMA_TAX_MULT_MAX = 1.0
+# Options scanner monthly-return slider: default high is 10%; user can drag up to this max.
+PH_SCAN_MO_RETURN_SLIDER_MAX = 30.0
 
 
 def _scanner_calendar_today() -> dt.date:
@@ -1095,7 +1097,7 @@ with _scan_return:
     _ret_range = st.slider(
         "Monthly return %",
         min_value=0.0,
-        max_value=10.0,
+        max_value=PH_SCAN_MO_RETURN_SLIDER_MAX,
         value=(3.0, 10.0),
         step=0.5,
         format="%.1f%%",

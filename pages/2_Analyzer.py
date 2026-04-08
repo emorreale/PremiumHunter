@@ -34,21 +34,21 @@ PH_WHEEL_MO_RETURN_PENALTY_LOW_PCT = 2.0
 PH_WHEEL_MO_RETURN_PENALTY_HIGH_PCT = 3.0
 PH_WHEEL_DTE_TARGET_DAYS = 5
 PH_WHEEL_DTE_GAMMA_POWER = 3.0
-PH_GAMMA_TAX_YIELD_REF_PCT = 10.0
+PH_GAMMA_TAX_YIELD_REF_PCT = 20.0
 PH_GAMMA_TAX_MULT_MIN = 0.5
 PH_GAMMA_TAX_MULT_MAX = 1.0
 # Matrix wheel scan: cap E*Trade option-chain calls (CSP puts only — matches Discover default scanner).
 PH_MATRIX_MAX_EXPIRIES = 5
 PH_MATRIX_CSP_SPOT_CACHE_DECIMALS = 4
-# Same Mo. Return % band as Discover Options Scanner default slider (inclusive).
+# Mo. Return % band: min fixed; max must match Discover PH_SCAN_MO_RETURN_SLIDER_MAX (inclusive).
 PH_MATRIX_MIN_MO_RETURN_PCT = 3.0
-PH_MATRIX_MAX_MO_RETURN_PCT = 10.0
+PH_MATRIX_MAX_MO_RETURN_PCT = 30.0
 # Plain text for hover tooltip on matrix Wheel Alpha gauge (no markdown).
 _PH_MATRIX_GAUGE_TIP = (
     "Wheel Alpha is the mean of the three highest scores from the same CSP scan as "
     "Discover’s Options Scanner (default): OTM puts only, America/Chicago calendar days, "
     f"expirations from the first listed through +60 days (capped at {PH_MATRIX_MAX_EXPIRIES} nearest), "
-    f"and {PH_MATRIX_MIN_MO_RETURN_PCT:g}%–{PH_MATRIX_MAX_MO_RETURN_PCT:g}% monthly return filter. "
+    f"and {PH_MATRIX_MIN_MO_RETURN_PCT:g}%–{PH_MATRIX_MAX_MO_RETURN_PCT:g}% monthly return filter (scanner slider max). "
     "Spot is E*Trade only (matches the scanner chain math)."
 )
 
