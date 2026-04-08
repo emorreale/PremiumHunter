@@ -1,3 +1,4 @@
+import copy
 import datetime as dt
 
 import pandas as pd
@@ -78,10 +79,34 @@ def get_quote(market, symbol: str) -> dict:
             break
     if not matched and rows:
         matched = rows[0]
-    import copy
     matched = copy.deepcopy(matched)
     matched["_raw_response"] = resp
     return matched
+
+
+def get_equity_quotes_batch(market, symbols: list[str]) -> dict[str, dict]:
+    """
+    Quote rows keyed by upper-case symbol. Chunks of 25 per E*Trade API limit.
+    Omits ``_raw_response`` (use ``get_quote`` when the full payload is needed).
+    """
+    out: dict[str, dict] = {}
+    ordered = sorted({str(s).upper().strip() for s in (symbols or []) if str(s).strip()})
+    for i in range(0, len(ordered), 25):
+        chunk = ordered[i : i + 25]
+        resp = market.get_quote(chunk, resp_format="json")
+        rows = _quote_data_rows(resp)
+        by_sym: dict[str, dict] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sym = _quote_row_symbol(row)
+            if sym:
+                by_sym[sym] = row
+        for sym in chunk:
+            row = by_sym.get(sym)
+            if row:
+                out[sym] = copy.deepcopy(row)
+    return out
 
 
 def get_last_trade_price(quote_row: dict):

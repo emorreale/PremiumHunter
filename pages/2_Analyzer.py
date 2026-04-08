@@ -2,6 +2,7 @@ import datetime as dt
 import html
 import json
 import math
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,7 @@ import yfinance as yf
 
 from etrade_market import (
     get_equity_display_price,
+    get_equity_quotes_batch,
     get_expiry_dates,
     get_option_chain,
     get_quote,
@@ -35,18 +37,25 @@ PH_WHEEL_DTE_GAMMA_POWER = 3.0
 PH_GAMMA_TAX_YIELD_REF_PCT = 10.0
 PH_GAMMA_TAX_MULT_MIN = 0.5
 PH_GAMMA_TAX_MULT_MAX = 1.0
-# Matrix wheel scan: cap E*Trade option-chain calls (PUT+CALL per expiry).
+# Matrix wheel scan: cap E*Trade option-chain calls (CSP puts only — matches Discover default scanner).
 PH_MATRIX_MAX_EXPIRIES = 5
-PH_MATRIX_CSP_SPOT_CACHE_DECIMALS = 2
-# Skip IV / Wheel Alpha until Mo. Return % exceeds this (cheap filter per row).
+PH_MATRIX_CSP_SPOT_CACHE_DECIMALS = 4
+# Same Mo. Return % band as Discover Options Scanner default slider (inclusive).
 PH_MATRIX_MIN_MO_RETURN_PCT = 3.0
+PH_MATRIX_MAX_MO_RETURN_PCT = 10.0
 # Plain text for hover tooltip on matrix Wheel Alpha gauge (no markdown).
 _PH_MATRIX_GAUGE_TIP = (
-    f"Wheel Alpha here is the average of the three highest Wheel Alpha scores after "
-    f"scanning your broker chains for this symbol: OTM cash-secured puts and OTM "
-    f"covered calls across the nearest few expirations."
-    f"Covered calls use the current stock price as share cost basis."
+    "Wheel Alpha is the mean of the three highest scores from the same CSP scan as "
+    "Discover’s Options Scanner (default): OTM puts only, America/Chicago calendar days, "
+    f"expirations from the first listed through +60 days (capped at {PH_MATRIX_MAX_EXPIRIES} nearest), "
+    f"and {PH_MATRIX_MIN_MO_RETURN_PCT:g}%–{PH_MATRIX_MAX_MO_RETURN_PCT:g}% monthly return filter. "
+    "Spot is E*Trade only (matches the scanner chain math)."
 )
+
+
+def _matrix_calendar_today() -> dt.date:
+    """Match Discover option scanner (`_scanner_calendar_today`); avoids UTC-vs-Chicago skew on Cloud."""
+    return dt.datetime.now(ZoneInfo("America/Chicago")).date()
 
 
 def _inject_matrix_gauge_hover_tip() -> None:
@@ -120,6 +129,13 @@ def _inject_matrix_gauge_hover_tip() -> None:
 
 
 # ── Cached helpers ──────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_quotes_batch(_market_id: int, symbols_key: tuple[str, ...]) -> dict[str, dict]:
+    if not symbols_key:
+        return {}
+    return get_equity_quotes_batch(market, list(symbols_key))
+
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _cached_quote(_market_id, symbol: str) -> dict | None:
@@ -332,6 +348,8 @@ def _matrix_wheel_alphas_from_chain(
         monthly_return = raw_return * (PH_AVG_CALENDAR_DAYS_PER_MONTH / calendar_dte) * 100.0
         if monthly_return <= PH_MATRIX_MIN_MO_RETURN_PCT:
             continue
+        if monthly_return > PH_MATRIX_MAX_MO_RETURN_PCT:
+            continue
         iv_dec = _scan_iv_to_decimal(getattr(row, "IV", None))
         iv_rank = _scan_iv_rank_pct(iv_dec, iv_lo, iv_hi)
         wa = _calculate_wheel_alpha(
@@ -350,15 +368,19 @@ def _matrix_wheel_alphas_from_chain(
 
 
 def _matrix_wheel_scan_body(_market_id: int, sym: str, spot: float) -> list[float]:
-    """Nearest expiries: CSP + CC chains; only rows with Mo. Return % > threshold."""
+    """
+    CSP (OTM puts) only, same calendar and expiry window defaults as Discover Options Scanner.
+    """
     if spot <= 0:
         return []
     expiries = _cached_expiry_dates(_market_id, sym)
     if not expiries:
         return []
-    today = dt.date.today()
-    cutoff = today + dt.timedelta(days=60)
-    selected = sorted(d for d in expiries if today < d <= cutoff)
+    today = _matrix_calendar_today()
+    _min_exp = expiries[0]
+    _max_exp = expiries[-1]
+    exp_to = min(_min_exp + dt.timedelta(days=60), _max_exp)
+    selected = sorted(d for d in expiries if _min_exp <= d <= exp_to and d > today)
     if not selected:
         selected = sorted(d for d in expiries if d > today)[:2]
     selected = selected[:PH_MATRIX_MAX_EXPIRIES]
@@ -369,15 +391,9 @@ def _matrix_wheel_scan_body(_market_id: int, sym: str, spot: float) -> list[floa
         if calendar_dte <= 0:
             continue
         put_chain = _cached_option_chain(_market_id, sym, exp_date, "PUT")
-        call_chain = _cached_option_chain(_market_id, sym, exp_date, "CALL")
         alphas.extend(
             _matrix_wheel_alphas_from_chain(
                 put_chain, spot, calendar_dte, is_put=True, iv_lo=iv_lo, iv_hi=iv_hi
-            )
-        )
-        alphas.extend(
-            _matrix_wheel_alphas_from_chain(
-                call_chain, spot, calendar_dte, is_put=False, iv_lo=iv_lo, iv_hi=iv_hi
             )
         )
     return alphas
@@ -385,7 +401,7 @@ def _matrix_wheel_scan_body(_market_id: int, sym: str, spot: float) -> list[floa
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _cached_matrix_wheel_alphas(_market_id: int, symbol: str, spot_key: str) -> list[float]:
-    """Cache combined CSP+CC alpha list per symbol + rounded spot."""
+    """Cache CSP-only alpha list per symbol + rounded E*Trade spot."""
     return _matrix_wheel_scan_body(_market_id, symbol, float(spot_key))
 
 
@@ -591,11 +607,11 @@ def _gauge_figure(score: float | None, *, height: int = 104) -> go.Figure:
 
 # ── Fetch data per ticker ──────────────────────────────────────────────────
 
-def _card_data(sym: str) -> dict:
+def _card_data(sym: str, quotes_batch: dict[str, dict] | None = None) -> dict:
     """
     Gather everything needed for one matrix card.
     Header price / day change match Discover's 1D chart (Yahoo last + Yahoo prior close).
-    Wheel Alpha scan spot uses E*Trade (same as Discover option chain math).
+    Wheel Alpha uses E*Trade spot only (same as Discover scanner); no Yahoo fallback for OTM math.
     """
     out: dict = {
         "sym": sym, "price": 0.0, "prev_close": 0.0,
@@ -609,7 +625,11 @@ def _card_data(sym: str) -> dict:
             out["price"] = float(y_last)
     except (TypeError, ValueError):
         pass
-    q = _cached_quote(id(market), sym)
+    su = sym.upper().strip()
+    if quotes_batch is not None and su in quotes_batch:
+        q = quotes_batch[su]
+    else:
+        q = _cached_quote(id(market), sym)
     spot_etrade = 0.0
     if q:
         try:
@@ -658,23 +678,25 @@ def _card_data(sym: str) -> dict:
     if out["price"] > 0 and out["prev_close"] > 0:
         out["chg"] = out["price"] - out["prev_close"]
         out["pct"] = (out["chg"] / out["prev_close"]) * 100
-    # Wheel Alpha: broker spot for OTM math (matches Discover scan), not Yahoo header.
-    spot_alpha = spot_etrade if spot_etrade > 0 else out["price"]
-    if spot_alpha > 0:
-        sk = f"{spot_alpha:.{PH_MATRIX_CSP_SPOT_CACHE_DECIMALS}f}"
+    # Wheel Alpha: E*Trade spot only (Discover scanner never uses Yahoo for chain/OTM).
+    if spot_etrade > 0:
+        sk = f"{spot_etrade:.{PH_MATRIX_CSP_SPOT_CACHE_DECIMALS}f}"
         alphas = _cached_matrix_wheel_alphas(id(market), sym, sk)
         out["t3_alpha"] = _top3_weighted_alpha(alphas)
+    else:
+        out["t3_alpha"] = None
     return out
 
 
 def _card_data_parallel(symbols: list[str]) -> list[dict]:
     """
-    Load one card per symbol. Sequential on purpose: the shared pyetrade ``market`` session
-    is not safe for concurrent get_quote / option-chain calls; parallel runs caused empty
-    chains and $0 quotes on Cloud. Yahoo spot vs E*Trade spot can still differ slightly
-    from local when one feed lags — that is expected.
+    One batched E*Trade quote request (≤25 symbols per API call), then sequential
+    option-chain scans (pyetrade session is not thread-safe for chains).
     """
-    return [_card_data(s) for s in symbols]
+    syms = [s for s in symbols if s]
+    key = tuple(sorted({str(s).upper().strip() for s in syms}))
+    batch = _cached_quotes_batch(id(market), key) if key else {}
+    return [_card_data(s, batch) for s in syms]
 
 
 # ── Page layout ─────────────────────────────────────────────────────────────
