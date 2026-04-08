@@ -122,7 +122,7 @@ def sync_watchlist_to_postgres(symbols: list[str], *, owner: str | None = None) 
         _LOG.warning("DATABASE_URL is empty — skipping Postgres watchlist sync")
         return
 
-    o = (owner or os.environ.get("WATCHLIST_OWNER") or "default").strip() or "default"
+    o = (owner or "default").strip() or "default"
     if len(symbols) <= 12:
         _sym_preview = repr(symbols)
     else:

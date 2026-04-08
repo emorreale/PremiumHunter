@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import streamlit as st
@@ -14,10 +15,21 @@ from watchlist_db import ensure_watchlist_logging, sync_watchlist_to_postgres
 _ROOT = Path(__file__).resolve().parent
 load_dotenv(_ROOT / ".env")
 
-_WATCHLIST_PATH = _ROOT / ".ph_watchlist.json"
+_LEGACY_WATCHLIST_PATH = _ROOT / ".ph_watchlist.json"
 _MAX_SYM_LEN = 10
 
 _LOG = logging.getLogger("premiumhunter.watchlist")
+
+
+def _owner_slug(owner: str) -> str:
+    o = (owner or "default").strip().lower() or "default"
+    o = re.sub(r"[^a-z0-9_-]+", "_", o)
+    o = o.strip("_")[:48]
+    return o or "default"
+
+
+def watchlist_path_for_owner(owner: str) -> Path:
+    return _ROOT / f".ph_watchlist.{_owner_slug(owner)}.json"
 
 
 def _dedupe(symbols: list[str]) -> list[str]:
@@ -30,13 +42,7 @@ def _dedupe(symbols: list[str]) -> list[str]:
     return out
 
 
-def load_watchlist() -> list[str]:
-    if not _WATCHLIST_PATH.is_file():
-        return []
-    try:
-        raw = json.loads(_WATCHLIST_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return []
+def _parse_watchlist_json(raw: object) -> list[str]:
     if isinstance(raw, list):
         syms = [
             str(x).upper().strip()[:_MAX_SYM_LEN]
@@ -45,7 +51,7 @@ def load_watchlist() -> list[str]:
         ]
         return _dedupe(syms)
     if isinstance(raw, dict):
-        tickers = raw.get("tickers")
+        tickers = raw.get("tickers") or raw.get("symbols")
         if isinstance(tickers, list):
             syms = [
                 str(x).upper().strip()[:_MAX_SYM_LEN]
@@ -56,8 +62,26 @@ def load_watchlist() -> list[str]:
     return []
 
 
+def load_watchlist_for_owner(owner: str) -> list[str]:
+    path = watchlist_path_for_owner(owner)
+    for candidate in (path, _LEGACY_WATCHLIST_PATH):
+        if not candidate.is_file():
+            continue
+        try:
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        syms = _parse_watchlist_json(raw)
+        if syms or candidate == path:
+            return syms
+    return []
+
+
 def save_watchlist(symbols: list[str]) -> None:
     ensure_watchlist_logging()
+
+    owner = (st.session_state.get("ph_watchlist_owner") or "default").strip() or "default"
+    path = watchlist_path_for_owner(owner)
 
     payload = _dedupe(
         [
@@ -66,17 +90,17 @@ def save_watchlist(symbols: list[str]) -> None:
             if x is not None and str(x).strip()
         ]
     )
-    _LOG.info("save_watchlist invoked (%d symbol(s))", len(payload))
+    _LOG.info("save_watchlist owner=%r (%d symbol(s))", owner, len(payload))
 
     try:
-        _WATCHLIST_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     except OSError as e:
-        _LOG.error("Local watchlist write failed %s — %s", _WATCHLIST_PATH, e)
+        _LOG.error("Local watchlist write failed %s — %s", path, e)
     else:
-        _LOG.info("Local file OK → %s", _WATCHLIST_PATH)
+        _LOG.info("Local file OK → %s", path)
 
     try:
-        sync_watchlist_to_postgres(payload)
+        sync_watchlist_to_postgres(payload, owner=owner)
     except Exception:
         _LOG.exception(
             "Postgres sync failed after local save (check DATABASE_URL, psycopg, RLS, and pooler)"
@@ -84,5 +108,8 @@ def save_watchlist(symbols: list[str]) -> None:
 
 
 def ensure_session_watchlist() -> None:
-    if "ph_watchlist" not in st.session_state:
-        st.session_state.ph_watchlist = load_watchlist()
+    owner = (st.session_state.get("ph_watchlist_owner") or "default").strip() or "default"
+    prev = st.session_state.get("ph_watchlist_loaded_for_owner")
+    if prev != owner or "ph_watchlist" not in st.session_state:
+        st.session_state.ph_watchlist_loaded_for_owner = owner
+        st.session_state.ph_watchlist = load_watchlist_for_owner(owner)

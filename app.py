@@ -41,6 +41,7 @@ from etrade_auth import (
     save_persisted_tokens,
 )
 from etrade_market import create_market_session, probe_etrade_tokens
+from ph_auth_gate import require_login
 from watchlist_persist import ensure_session_watchlist
 
 
@@ -77,6 +78,7 @@ def _ensure_etrade_connect_logging() -> None:
 
 
 st.set_page_config(page_title="PremiumHunter", page_icon="assets/logo_icon.svg", layout="wide")
+_authenticator = require_login()
 ensure_session_watchlist()
 
 st.logo(
@@ -86,7 +88,7 @@ st.logo(
 )
 
 st.markdown("""
-<style>
+<style id="ph-app-style">
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500;700&display=swap');
 
 /* ── Base ────────────────────────────────────────────────────── */
@@ -308,15 +310,17 @@ header[data-testid="stHeader"] img[data-testid="stLogo"] {
     width: auto !important;
 }
 
-/* Breathing room below app header so first content (index tape) is not clipped */
+/* Space below fixed header — keep modest; large values + markdown wrapper looked like
+   an empty gap on refresh; style host is collapsed via #ph-app-style rules above. */
 section[data-testid="stMain"] > div.block-container {
-    padding-top: 2.65rem !important;
+    padding-top: 1.15rem !important;
     overflow: visible !important;
 }
-/* Tape row: padding only above; no bottom pad so the strip sits tight on the divider */
+/* Tape row: tight to block top; divider sits flush below */
 section[data-testid="stMain"] [data-testid="stHorizontalBlock"]:has([data-testid="stColumn"] [class*="st-key-ph_idx_pick_"]) {
-    padding-top: 0.55rem !important;
+    padding-top: 0.35rem !important;
     padding-bottom: 0 !important;
+    margin-top: 0 !important;
 }
 
 /* ── Index tape: st-key-<key> on widget; stColumn (not "column") is the flex child wrapper ─ */
@@ -406,6 +410,18 @@ header [data-testid="stSidebarNav"] a[aria-current="page"] {
     color: #00ff88 !important;
     background: rgba(0,255,136,0.10) !important;
 }
+
+/* Injected <style> sits in a markdown block — collapse that wrapper so refresh/rerun
+   doesn’t leave a tall empty band or clip the nav/tape against the header. */
+[data-testid="element-container"]:has(#ph-app-style),
+[data-testid="stMarkdownContainer"]:has(#ph-app-style) {
+    margin: 0 !important;
+    padding: 0 !important;
+    min-height: 0 !important;
+}
+[data-testid="element-container"]:has(#ph-app-style) {
+    margin-bottom: 0 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -436,7 +452,27 @@ def _ph_etrade_connect_on_click() -> None:
     st.session_state["_ph_etrade_connect_pending"] = True
 
 
+def _ph_on_app_logout(_logout_event: object) -> None:
+    """streamlit-authenticator calls this with a dict (widget, username, …); we only clear session."""
+    for _k in (
+        "ph_watchlist",
+        "ph_watchlist_loaded_for_owner",
+        "ph_watchlist_owner",
+        "ph_cookie_expiry_locked",
+    ):
+        st.session_state.pop(_k, None)
+
+
 with st.sidebar:
+    _ph_who = st.session_state.get("name") or st.session_state.get("username") or "?"
+    st.caption(f"Signed in as **{_ph_who}**")
+    _authenticator.logout(
+        "Log out",
+        location="sidebar",
+        key="ph_auth_logout",
+        callback=_ph_on_app_logout,
+    )
+    st.divider()
     st.header("E-Trade Authentication")
 
     if st.session_state.tokens is None:

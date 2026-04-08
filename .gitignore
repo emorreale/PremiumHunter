@@ -1,6 +1,8 @@
 .env
 .etrade_tokens.json
 .ph_watchlist.json
+.ph_watchlist.*.json
+.streamlit/secrets.toml
 __pycache__/
 *.pyc
 .venv/

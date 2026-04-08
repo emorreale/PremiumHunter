@@ -7,7 +7,7 @@ Required env:
   DATABASE_URL
 
 Optional:
-  WATCHLIST_OWNER  — primary key for the row to upsert (default "default"); the scan job merges symbols from every row.
+  --owner NAME     — primary key for the row to upsert (default "default"); the scan job merges symbols from every row.
 
 Input (first match wins):
   1. --file PATH   — JSON array or { "tickers": [...] } / { "symbols": [...] }
@@ -64,6 +64,12 @@ def main() -> int:
         metavar="PATH",
         help='JSON file, or "-" for stdin',
     )
+    parser.add_argument(
+        "--owner",
+        "-o",
+        default="default",
+        help='watchlists.owner primary key (default "default")',
+    )
     args = parser.parse_args()
 
     database_url = (os.environ.get("DATABASE_URL") or "").strip()
@@ -71,7 +77,7 @@ def main() -> int:
         print("DATABASE_URL is required", file=sys.stderr)
         return 1
 
-    owner = (os.environ.get("WATCHLIST_OWNER") or "default").strip() or "default"
+    owner = (args.owner or "default").strip() or "default"
 
     try:
         raw = _load_raw_json(args)
