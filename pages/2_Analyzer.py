@@ -2,7 +2,6 @@ import datetime as dt
 import html
 import json
 import math
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -638,6 +637,9 @@ def _card_data(sym: str) -> dict:
         close_s = pd.to_numeric(hist["Close"], errors="coerce").dropna()
         if len(close_s) >= 2:
             out["closes"] = close_s.tolist()
+    # Yahoo `info` often 401s on Cloud while `history` still returns bars — fill header + alpha spot.
+    if out["price"] <= 0 and out["closes"]:
+        out["price"] = float(out["closes"][-1])
     # Prior close: Discover 1D baseline (Yahoo info first), then daily history fallback.
     prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
     try:
@@ -651,6 +653,8 @@ def _card_data(sym: str) -> dict:
             dc = pd.to_numeric(h_daily["Close"], errors="coerce").dropna()
             if len(dc) >= 2:
                 out["prev_close"] = float(dc.iloc[-2])
+    if out["prev_close"] <= 0 and len(out["closes"]) >= 2:
+        out["prev_close"] = float(out["closes"][0])
     if out["price"] > 0 and out["prev_close"] > 0:
         out["chg"] = out["price"] - out["prev_close"]
         out["pct"] = (out["chg"] / out["prev_close"]) * 100
@@ -664,12 +668,13 @@ def _card_data(sym: str) -> dict:
 
 
 def _card_data_parallel(symbols: list[str]) -> list[dict]:
-    """Load one card per symbol; overlap I/O when the watchlist has multiple tickers."""
-    if len(symbols) <= 1:
-        return [_card_data(s) for s in symbols]
-    workers = min(6, len(symbols))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(_card_data, symbols))
+    """
+    Load one card per symbol. Sequential on purpose: the shared pyetrade ``market`` session
+    is not safe for concurrent get_quote / option-chain calls; parallel runs caused empty
+    chains and $0 quotes on Cloud. Yahoo spot vs E*Trade spot can still differ slightly
+    from local when one feed lags — that is expected.
+    """
+    return [_card_data(s) for s in symbols]
 
 
 # ── Page layout ─────────────────────────────────────────────────────────────
