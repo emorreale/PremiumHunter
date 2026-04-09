@@ -78,6 +78,7 @@ jobs:
           path: etrade_token_debug.png
           if-no-files-found: ignore
 
+      # Mo. Return / Wheel Alpha calendar DTE = ph_wheel_calendar_dte (same as Streamlit Discover + Analyzer).
       - name: Run watchlist scan + Wheel Alpha
         env:
           DATABASE_FORCE_IPV4: "1"

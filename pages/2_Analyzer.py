@@ -17,6 +17,7 @@ from etrade_market import (
     get_option_chain,
     get_quote,
 )
+# Calendar DTE for Mo. Return + Wheel Alpha: shared with Discover + watchlist_snapshot_to_postgres.
 from ph_wheel_calendar_dte import wheel_alpha_effective_calendar_dte
 from watchlist_persist import ensure_session_watchlist, save_watchlist
 
@@ -389,6 +390,7 @@ def _matrix_wheel_scan_body(_market_id: int, sym: str, spot: float) -> list[floa
     iv_lo, iv_hi = _cached_52w_iv_rank_bounds(sym)
     alphas: list[float] = []
     for exp_date in selected:
+        # ph_wheel_calendar_dte only (parity with Discover + watchlist_snapshot_to_postgres).
         calendar_dte = wheel_alpha_effective_calendar_dte(exp_date)
         if calendar_dte <= 0:
             continue

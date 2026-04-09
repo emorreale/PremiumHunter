@@ -17,6 +17,7 @@ from etrade_market import (
     get_option_chain,
     get_quote,
 )
+# Calendar DTE for Mo. Return % + Wheel Alpha: shared with 2_Analyzer + watchlist_snapshot_to_postgres.
 from ph_wheel_calendar_dte import wheel_alpha_effective_calendar_dte
 from watchlist_persist import ensure_session_watchlist, save_watchlist
 
@@ -30,7 +31,8 @@ market = st.session_state.market
 PH_PRICE_CHART_HEIGHT = 400
 # Wheel Alpha OTM safety: cushion = PH_WHEEL_OTM_SAFETY_STD × expected 1SD % (IV×√(DTE/365)×100).
 PH_WHEEL_OTM_SAFETY_STD = 0.75
-# Monthly return %: (premium / ref) × (avg days per month / calendar DTE) × 100
+# Monthly return %: (premium / ref) × (avg days per month / calendar DTE) × 100;
+# calendar DTE is only wheel_alpha_effective_calendar_dte (ph_wheel_calendar_dte).
 PH_AVG_CALENDAR_DAYS_PER_MONTH = 30.42  # ~365.25 / 12
 # Mo. Return % hinge: below hinge = strict linear penalty (0× at ≤2%, →1× at 3%);
 # at/above hinge = log₂-tuned factor in [0.60, 1.0] to favor higher yields vs heavy log smoothing.
@@ -59,7 +61,7 @@ def _scanner_trading_dte_anchor_date() -> dt.date:
     calendar), the next session is used so a late-evening scan does not still count
     'today' as a full trading day. Calendar DTE, Mo. Return %, and Wheel Alpha still
     use `_scanner_calendar_today()` for the date; Mo. Return % and Wheel Alpha use
-    `wheel_alpha_effective_calendar_dte` so today's slab decays toward Chicago midnight.
+    `wheel_alpha_effective_calendar_dte` (Chicago midnight slices + fixed expiry time on exp date).
     """
     chi = ZoneInfo("America/Chicago")
     now = dt.datetime.now(chi)
@@ -296,7 +298,7 @@ def _calculate_wheel_alpha(
 ) -> float:
     """
     Wheel Alpha: yield × safety vs vol × time, scaled to 0–100.
-    calendar_dte is fractional (Chicago: today's slab = time left until midnight / 24h).
+    calendar_dte is fractional (Chicago): rest of today to midnight, full days between, exp date to expiry clock.
     Safety factor = (|OTM %| / cushion %)²; cushion = PH_WHEEL_OTM_SAFETY_STD × IV×√(DTE/365)×100.
     DTE weight = (calendar DTE / target)^power below target days, else 1; scales yield×safety.
     Mo. Return % below 3%: same linear penalty (0× at ≤2%, →1× at 3%). At/above 3%: log₂-tuned
@@ -1186,7 +1188,7 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
         # busday_count excludes the start date; +1 when exp > anchor makes the count
         # inclusive through expiration (Mon–Fri; NumPy does not apply exchange holidays).
         # Anchor advances after RTH close / on weekends — trading DTE only. Mo. Return /
-        # Wheel Alpha use wheel_alpha_effective_calendar_dte (today decays to Chicago midnight).
+        # Mo. Return / Wheel Alpha: wheel_alpha_effective_calendar_dte (midnight slices + expiry time).
         _raw_dte = int(
             np.busday_count(
                 np.datetime64(_dte_anchor),
@@ -1197,6 +1199,7 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
         if dte <= 0:
             continue
 
+        # ph_wheel_calendar_dte only (parity with 2_Analyzer + watchlist_snapshot_to_postgres).
         calendar_dte = wheel_alpha_effective_calendar_dte(exp_date)
         if calendar_dte <= 0:
             continue
@@ -1295,8 +1298,9 @@ _PH_SCAN_COL_HELP: dict[str, str] = {
     "Mo. Return %": (
         "(Premium / reference) × (30.42 / calendar days to expiration) × 100. "
         "Puts: reference = strike. Calls: reference = spot. "
-        "Effective calendar days = (expiration − Chicago today) with today's slab = hours "
-        "left until Chicago midnight ÷ 24 (not trading days)."
+        "Effective calendar days (Chicago): hours left today until midnight ÷ 24, plus 1 per "
+        "calendar day in between, plus expiration date from midnight to 12:00 PM Chicago ÷ 24 "
+        "(see ph_wheel_calendar_dte.PH_EXPIRY_WALL_TIME_CHI; not trading days)."
     ),
     "IV": "Implied volatility from the chain (format varies by broker).",
     "IV Rank": (

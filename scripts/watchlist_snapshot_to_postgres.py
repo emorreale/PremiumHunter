@@ -8,6 +8,9 @@ and persist results to PostgreSQL:
 
 Designed for GitHub Actions (no Streamlit).
 
+Mo. Return % and Wheel Alpha use the same calendar-DTE span as the Streamlit app:
+``ph_wheel_calendar_dte.wheel_alpha_effective_calendar_dte`` (do not duplicate).
+
 Required env:
   DATABASE_URL          — Postgres connection URI
   ETRADE_CONSUMER_KEY, ETRADE_CONSUMER_SECRET
@@ -52,6 +55,7 @@ if str(_ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 
+# Calendar DTE: must match pages/1_Discover.py and pages/2_Analyzer.py (single implementation).
 from ph_wheel_calendar_dte import wheel_alpha_effective_calendar_dte
 from watchlist_db import normalize_watchlist_symbols
 
@@ -534,6 +538,7 @@ def main() -> int:
 
             with conn.cursor() as cur:
                 for exp_date in selected:
+                    # Same calendar span as Discover / Analyzer (ph_wheel_calendar_dte).
                     calendar_dte = wheel_alpha_effective_calendar_dte(exp_date)
                     if calendar_dte <= 0:
                         continue
