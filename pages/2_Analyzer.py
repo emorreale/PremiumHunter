@@ -346,7 +346,7 @@ def _matrix_wheel_alphas_from_chain(
         else:
             if otm_pct <= 0:
                 continue
-            raw_return = bid / spot
+            raw_return = bid / strike  # CC: true return on capital at strike (same as Discover)
             cost_basis = spot
         monthly_return = raw_return * (PH_AVG_CALENDAR_DAYS_PER_MONTH / calendar_dte) * 100.0
         if monthly_return <= PH_MATRIX_MIN_MO_RETURN_PCT:

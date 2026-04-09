@@ -56,11 +56,7 @@ if str(_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 # Calendar DTE: must match pages/1_Discover.py and pages/2_Analyzer.py (single implementation).
-from ph_wheel_calendar_dte import (
-    log_calendar_dte_breakdown,
-    log_wheel_calendar_clock,
-    wheel_alpha_effective_calendar_dte_detail,
-)
+from ph_wheel_calendar_dte import wheel_alpha_effective_calendar_dte
 from watchlist_db import normalize_watchlist_symbols
 
 load_dotenv(_ROOT / ".env")
@@ -506,7 +502,6 @@ def main() -> int:
         total_rows = 0
         today = _scan_date_chicago()
         dte_anchor = _trading_dte_anchor_chicago()
-        log_wheel_calendar_clock("watchlist_snapshot_to_postgres")
 
         for sym in symbols:
             print(f"Scanning {sym}…")
@@ -543,15 +538,10 @@ def main() -> int:
 
             with conn.cursor() as cur:
                 for exp_date in selected:
-                    _cal_t = wheel_alpha_effective_calendar_dte_detail(exp_date)
-                    calendar_dte = _cal_t[0]
+                    # Same calendar span as Discover / Analyzer (ph_wheel_calendar_dte).
+                    calendar_dte = wheel_alpha_effective_calendar_dte(exp_date)
                     if calendar_dte <= 0:
                         continue
-                    log_calendar_dte_breakdown(
-                        f"watchlist_snapshot {sym}",
-                        exp_date,
-                        detail=_cal_t,
-                    )
                     raw_bus = int(
                         np.busday_count(
                             np.datetime64(dte_anchor),
@@ -580,7 +570,8 @@ def main() -> int:
                                 continue
                             if (not is_put) and otm_pct <= 0:
                                 continue
-                            raw_return = bid / strike if is_put else bid / spot
+                            # CSP and covered calls: premium / strike (CC = true return on capital at short strike).
+                            raw_return = bid / strike
                             mo_yield = raw_return * (PH_AVG_CALENDAR_DAYS_PER_MONTH / calendar_dte) * 100.0
                             if mo_yield <= PH_SYNC_MIN_MO_YIELD_PCT:
                                 continue

@@ -18,13 +18,7 @@ from etrade_market import (
     get_quote,
 )
 # Calendar DTE for Mo. Return % + Wheel Alpha: shared with 2_Analyzer + watchlist_snapshot_to_postgres.
-from ph_wheel_calendar_dte import (
-    log_calendar_dte_breakdown,
-    log_wheel_calendar_clock,
-    wheel_alpha_effective_calendar_dte_detail,
-    wheel_calendar_chicago_now,
-    wheel_calendar_override_active,
-)
+from ph_wheel_calendar_dte import wheel_alpha_effective_calendar_dte
 from watchlist_persist import ensure_session_watchlist, save_watchlist
 
 if st.session_state.get("market") is None:
@@ -37,7 +31,7 @@ market = st.session_state.market
 PH_PRICE_CHART_HEIGHT = 400
 # Wheel Alpha OTM safety: cushion = PH_WHEEL_OTM_SAFETY_STD × expected 1SD % (IV×√(DTE/365)×100).
 PH_WHEEL_OTM_SAFETY_STD = 0.75
-# Monthly return %: (premium / ref) × (avg days per month / calendar DTE) × 100;
+# Monthly return %: (premium / ref) × (avg days per month / calendar DTE) × 100 (puts & CC: ref = strike);
 # calendar DTE is only wheel_alpha_effective_calendar_dte (ph_wheel_calendar_dte).
 PH_AVG_CALENDAR_DAYS_PER_MONTH = 30.42  # ~365.25 / 12
 # Mo. Return % hinge: below hinge = strict linear penalty (0× at ≤2%, →1× at 3%);
@@ -361,11 +355,12 @@ def _bar_calendar_date(ts):
     return t.date()
 
 
-def _previous_session_close(ticker_sym: str, hist) -> float | None:
-    """Last daily Close strictly before the first bar's trading day (Yahoo baseline)."""
-    first_day = _bar_calendar_date(hist.index[0])
+def _prior_close_from_daily_history(
+    ticker_sym: str, before_day: dt.date
+) -> float | None:
+    """Last daily Close on a session date strictly before before_day (US/Eastern bar date)."""
     try:
-        end_dt = pd.Timestamp(first_day)
+        end_dt = pd.Timestamp(before_day)
         start_dt = end_dt - pd.Timedelta(days=45)
         daily = yf.Ticker(ticker_sym).history(
             start=start_dt.strftime("%Y-%m-%d"),
@@ -387,9 +382,18 @@ def _previous_session_close(ticker_sym: str, hist) -> float | None:
     ref = None
     for idx in daily.index:
         d = _bar_calendar_date(idx)
-        if d < first_day:
+        if d < before_day:
             ref = float(daily.loc[idx, "Close"])
     return ref
+
+
+def _previous_session_close(ticker_sym: str, hist) -> float | None:
+    """Last daily Close strictly before the first bar's trading day (Yahoo baseline)."""
+    if hist is None or hist.empty:
+        return None
+    return _prior_close_from_daily_history(
+        ticker_sym, _bar_calendar_date(hist.index[0])
+    )
 
 
 def _make_google_style_chart(ticker: str, period_key: str, yf_info: dict):
@@ -417,22 +421,28 @@ def _make_google_style_chart(ticker: str, period_key: str, yf_info: dict):
     except (TypeError, ValueError):
         end = last_hist
 
-    # Baseline (start price) — matches Yahoo Finance convention:
-    #   1D  → previousClose from yfinance info
+    # Baseline for change % and (1D) dotted line — always prior session close, not today's open.
+    #   1D  → yfinance previousClose* when present, else last daily Close before first intraday bar
     #   All others → last daily Close before the first bar's calendar date
     _prev_close_line: float | None = None
     if period_key == "1D":
-        prev_close = yf_info.get("previousClose") or yf_info.get(
-            "regularMarketPreviousClose"
-        )
-        if prev_close is not None and not pd.isna(prev_close):
-            base = float(prev_close)
-            _prev_close_line = base
-        else:
-            base = float(hist["Open"].iloc[0])
+        base = None
+        for _k in ("previousClose", "regularMarketPreviousClose", "chartPreviousClose"):
+            pv = yf_info.get(_k)
+            if pv is not None and not pd.isna(pv):
+                try:
+                    _v = float(pv)
+                    if _v > 0:
+                        base = _v
+                        break
+                except (TypeError, ValueError):
+                    pass
+        if base is None:
             _psc = _previous_session_close(ticker, hist)
             if _psc is not None:
-                _prev_close_line = float(_psc)
+                base = float(_psc)
+        if base is not None:
+            _prev_close_line = float(base)
     else:
         psc = _previous_session_close(ticker, hist)
         base = psc if psc is not None else float(hist["Open"].iloc[0])
@@ -699,9 +709,6 @@ def _scan_table_styler(df: pd.DataFrame):
         "DTE (Trading Days)": lambda x: ""
         if pd.isna(x)
         else str(int(x)),
-        "Cal. days": lambda x: ""
-        if pd.isna(x)
-        else f"{float(x):.4f}",
         "Strike": _money,
         "OTM %": _pct,
         "Mo. Return %": _pct,
@@ -1183,8 +1190,6 @@ _scan_rows: list[dict] = []
 _today = _scanner_calendar_today()
 _dte_anchor = _scanner_trading_dte_anchor_date()
 
-log_wheel_calendar_clock("discover_options_scan")
-
 with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
     for exp_date in _selected_expiries:
         try:
@@ -1199,7 +1204,7 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
         # busday_count excludes the start date; +1 when exp > anchor makes the count
         # inclusive through expiration (Mon–Fri; NumPy does not apply exchange holidays).
         # Anchor advances after RTH close / on weekends — trading DTE only. Mo. Return /
-        # Wheel Alpha: wheel_alpha_effective_calendar_dte (midnight slices + expiry time).
+        # Mo. Return / Wheel Alpha: wheel_alpha_effective_calendar_dte (midnight slices + expiry time).
         _raw_dte = int(
             np.busday_count(
                 np.datetime64(_dte_anchor),
@@ -1211,15 +1216,9 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
             continue
 
         # ph_wheel_calendar_dte only (parity with 2_Analyzer + watchlist_snapshot_to_postgres).
-        _cal_detail = wheel_alpha_effective_calendar_dte_detail(exp_date)
-        calendar_dte = _cal_detail[0]
+        calendar_dte = wheel_alpha_effective_calendar_dte(exp_date)
         if calendar_dte <= 0:
             continue
-        log_calendar_dte_breakdown(
-            "discover_options_scan",
-            exp_date,
-            detail=_cal_detail,
-        )
 
         for _, row in chain.iterrows():
             bid = float(row.get("Bid", 0) or 0)
@@ -1243,8 +1242,8 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
                 # CSP: premium / strike × (30.42 / calendar DTE) × 100
                 raw_return = bid / strike
             else:
-                # CC: premium / spot × (30.42 / calendar DTE) × 100
-                raw_return = bid / current_price
+                # CC: premium / strike × (30.42 / calendar DTE) × 100 (true return on capital at short strike)
+                raw_return = bid / strike
 
             monthly_return = (
                 raw_return * (PH_AVG_CALENDAR_DAYS_PER_MONTH / calendar_dte) * 100.0
@@ -1268,7 +1267,6 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
                 _scan_rows.append({
                     "Expiration Date": exp_date.strftime("%Y-%m-%d"),
                     "DTE (Trading Days)": dte,
-                    "Cal. days": round(calendar_dte, 4),
                     "Strike": strike,
                     "OTM %": round(otm_pct, 2),
                     "Mo. Return %": round(monthly_return, 2),
@@ -1289,13 +1287,9 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
                     "Volume": int(row.get("Volume", 0) or 0),
                 })
 
-_scan_chi_now = wheel_calendar_chicago_now()
-_scan_chi_override = wheel_calendar_override_active()
-
 _SCAN_COL_ORDER = (
     "Expiration Date",
     "DTE (Trading Days)",
-    "Cal. days",
     "Strike",
     "OTM %",
     "Mo. Return %",
@@ -1315,16 +1309,11 @@ _PH_SCAN_COL_HELP: dict[str, str] = {
         "not excluded). After 4:00 PM US/Eastern on a weekday, or on Sat/Sun (Chicago "
         "date), counting starts from the next session so the closed session is not included."
     ),
-    "Cal. days": (
-        "Fractional calendar span (Chicago) used as Mo. Return % denominator: rest of today "
-        "to midnight ÷ 24 + full days between + expiry date to PH_EXPIRY_WALL_TIME_CHI ÷ 24. "
-        "Must match stderr log lines [discover_options_scan] exp=… detail=…."
-    ),
     "Strike": "Strike price for this contract.",
     "OTM %": "Moneyness vs spot: negative for OTM puts, positive for OTM calls.",
     "Mo. Return %": (
         "(Premium / reference) × (30.42 / calendar days to expiration) × 100. "
-        "Puts: reference = strike. Calls: reference = spot. "
+        "Puts and covered calls: reference = strike (cash working at strike — short put margin / assignment or short-call obligation level). "
         "Effective calendar days (Chicago): hours left today until midnight ÷ 24, plus 1 per "
         "calendar day in between, plus expiration date from midnight to 12:00 PM Chicago ÷ 24 "
         "(see ph_wheel_calendar_dte.PH_EXPIRY_WALL_TIME_CHI; not trading days)."
@@ -1366,12 +1355,6 @@ if _scan_rows:
     )
     _scan_styled = _scan_table_styler(_scan_df)
     _scan_h = min(400, 35 * len(_scan_df) + 38)
-    st.caption(
-        f"Calendar span for Mo. Return % / Wheel Alpha uses Chicago: **{_scan_chi_now:%Y-%m-%d %I:%M %p %Z}**"
-        f"{' (PH_CHICAGO_NOW_OVERRIDE)' if _scan_chi_override else ''}. "
-        "Streamlit Cloud still converts the host UTC clock to Central—wrong numbers are usually a "
-        "different bid or a different Chicago calendar day than you expect, not the host region."
-    )
     st.markdown(
         f'<p style="color:#9aa0a6;font-size:0.88rem;margin:2px 0 4px 0">'
         f'{len(_scan_df)} contracts found &nbsp;·&nbsp; '
@@ -1390,33 +1373,7 @@ if _scan_rows:
         width="stretch",
         height=min(520, _scan_h + 22),
     )
-    with st.expander("Mo. Return % arithmetic check (Bid ÷ ref × 30.42 ÷ Cal. days × 100)", expanded=False):
-        _mo_chk: list[dict] = []
-        for _, rr in _scan_df.iterrows():
-            _cd = float(rr["Cal. days"])
-            _b = float(rr["Bid"])
-            _ref = float(rr["Strike"]) if _chain_type == "PUT" else float(current_price)
-            _mo_c = (_b / _ref) * (PH_AVG_CALENDAR_DAYS_PER_MONTH / _cd) * 100.0
-            _mo_chk.append({
-                "Expiration": rr["Expiration Date"],
-                "Cal. days": round(_cd, 6),
-                "Bid": _b,
-                "Ref": _ref,
-                "Mo % recomputed": round(_mo_c, 4),
-                "Mo % table": rr["Mo. Return %"],
-            })
-        st.dataframe(pd.DataFrame(_mo_chk), width="stretch", hide_index=True)
-        st.caption(
-            "Recomputed Mo % should match the table. Example: Cal. days ≈ 8.6 and Mo % ≈ 5.0 with "
-            "Bid 1.49 / Strike 105; **~5.3%** needs either **Cal. days ≈ 8.14** or a **higher Bid** "
-            "(live chain may differ from a screenshot)."
-        )
 else:
-    st.caption(
-        f"Calendar span for Mo. Return % / Wheel Alpha uses Chicago: **{_scan_chi_now:%Y-%m-%d %I:%M %p %Z}**"
-        f"{' (PH_CHICAGO_NOW_OVERRIDE)' if _scan_chi_override else ''}. "
-        "Streamlit Cloud uses the host clock converted to Central, not the server’s raw local zone."
-    )
     st.info("No contracts match the selected filters. Try widening the date range or return %.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
