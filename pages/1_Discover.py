@@ -19,8 +19,9 @@ from etrade_market import (
 )
 # Calendar DTE for Mo. Return % + Wheel Alpha: shared with 2_Analyzer + watchlist_snapshot_to_postgres.
 from ph_wheel_calendar_dte import (
+    log_calendar_dte_breakdown,
     log_wheel_calendar_clock,
-    wheel_alpha_effective_calendar_dte,
+    wheel_alpha_effective_calendar_dte_detail,
     wheel_calendar_chicago_now,
     wheel_calendar_override_active,
 )
@@ -698,6 +699,9 @@ def _scan_table_styler(df: pd.DataFrame):
         "DTE (Trading Days)": lambda x: ""
         if pd.isna(x)
         else str(int(x)),
+        "Cal. days": lambda x: ""
+        if pd.isna(x)
+        else f"{float(x):.4f}",
         "Strike": _money,
         "OTM %": _pct,
         "Mo. Return %": _pct,
@@ -1207,9 +1211,15 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
             continue
 
         # ph_wheel_calendar_dte only (parity with 2_Analyzer + watchlist_snapshot_to_postgres).
-        calendar_dte = wheel_alpha_effective_calendar_dte(exp_date)
+        _cal_detail = wheel_alpha_effective_calendar_dte_detail(exp_date)
+        calendar_dte = _cal_detail[0]
         if calendar_dte <= 0:
             continue
+        log_calendar_dte_breakdown(
+            "discover_options_scan",
+            exp_date,
+            detail=_cal_detail,
+        )
 
         for _, row in chain.iterrows():
             bid = float(row.get("Bid", 0) or 0)
@@ -1258,6 +1268,7 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
                 _scan_rows.append({
                     "Expiration Date": exp_date.strftime("%Y-%m-%d"),
                     "DTE (Trading Days)": dte,
+                    "Cal. days": round(calendar_dte, 4),
                     "Strike": strike,
                     "OTM %": round(otm_pct, 2),
                     "Mo. Return %": round(monthly_return, 2),
@@ -1284,6 +1295,7 @@ _scan_chi_override = wheel_calendar_override_active()
 _SCAN_COL_ORDER = (
     "Expiration Date",
     "DTE (Trading Days)",
+    "Cal. days",
     "Strike",
     "OTM %",
     "Mo. Return %",
@@ -1302,6 +1314,11 @@ _PH_SCAN_COL_HELP: dict[str, str] = {
         "Trading days through expiration, inclusive (Mon–Fri only; exchange holidays "
         "not excluded). After 4:00 PM US/Eastern on a weekday, or on Sat/Sun (Chicago "
         "date), counting starts from the next session so the closed session is not included."
+    ),
+    "Cal. days": (
+        "Fractional calendar span (Chicago) used as Mo. Return % denominator: rest of today "
+        "to midnight ÷ 24 + full days between + expiry date to PH_EXPIRY_WALL_TIME_CHI ÷ 24. "
+        "Must match stderr log lines [discover_options_scan] exp=… detail=…."
     ),
     "Strike": "Strike price for this contract.",
     "OTM %": "Moneyness vs spot: negative for OTM puts, positive for OTM calls.",
@@ -1373,6 +1390,27 @@ if _scan_rows:
         width="stretch",
         height=min(520, _scan_h + 22),
     )
+    with st.expander("Mo. Return % arithmetic check (Bid ÷ ref × 30.42 ÷ Cal. days × 100)", expanded=False):
+        _mo_chk: list[dict] = []
+        for _, rr in _scan_df.iterrows():
+            _cd = float(rr["Cal. days"])
+            _b = float(rr["Bid"])
+            _ref = float(rr["Strike"]) if _chain_type == "PUT" else float(current_price)
+            _mo_c = (_b / _ref) * (PH_AVG_CALENDAR_DAYS_PER_MONTH / _cd) * 100.0
+            _mo_chk.append({
+                "Expiration": rr["Expiration Date"],
+                "Cal. days": round(_cd, 6),
+                "Bid": _b,
+                "Ref": _ref,
+                "Mo % recomputed": round(_mo_c, 4),
+                "Mo % table": rr["Mo. Return %"],
+            })
+        st.dataframe(pd.DataFrame(_mo_chk), width="stretch", hide_index=True)
+        st.caption(
+            "Recomputed Mo % should match the table. Example: Cal. days ≈ 8.6 and Mo % ≈ 5.0 with "
+            "Bid 1.49 / Strike 105; **~5.3%** needs either **Cal. days ≈ 8.14** or a **higher Bid** "
+            "(live chain may differ from a screenshot)."
+        )
 else:
     st.caption(
         f"Calendar span for Mo. Return % / Wheel Alpha uses Chicago: **{_scan_chi_now:%Y-%m-%d %I:%M %p %Z}**"

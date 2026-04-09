@@ -99,6 +99,62 @@ def wheel_calendar_override_active() -> bool:
     return False
 
 
+def wheel_alpha_effective_calendar_dte_detail(
+    expiration_date: dt.date,
+) -> tuple[float, dict[str, float | str]]:
+    """
+    Same total as ``wheel_alpha_effective_calendar_dte``, plus a breakdown dict for logging/UI.
+    On invalid dates returns (-1.0, {"reason": "..."}).
+    """
+    now = wheel_calendar_chicago_now()
+    today = now.date()
+    if expiration_date < today:
+        return -1.0, {"reason": "expiration_date before Chicago today", "chicago_date": str(today)}
+
+    exp_dt = dt.datetime.combine(expiration_date, PH_EXPIRY_WALL_TIME_CHI, tzinfo=_CHI)
+    if exp_dt <= now:
+        return -1.0, {"reason": "expiry moment not after now", "expiry_iso": exp_dt.isoformat()}
+
+    if expiration_date == today:
+        raw_sec = (exp_dt - now).total_seconds()
+        total = max(raw_sec / 86400.0, WHEEL_ALPHA_MIN_CALENDAR_DTE_DAYS)
+        return float(total), {
+            "branch": "same_calendar_day_as_expiry",
+            "chicago_now": now.isoformat(),
+            "seconds_to_expiry": raw_sec,
+            "total_days": total,
+        }
+
+    midnight_after_today = dt.datetime.combine(
+        today + dt.timedelta(days=1),
+        dt.time(0, 0, 0),
+        tzinfo=_CHI,
+    )
+    frac_today_raw = (midnight_after_today - now).total_seconds() / 86400.0
+    frac_today = max(frac_today_raw, WHEEL_ALPHA_MIN_CALENDAR_DTE_DAYS)
+
+    midnight_exp = dt.datetime.combine(
+        expiration_date, dt.time(0, 0, 0), tzinfo=_CHI
+    )
+    frac_exp_day = (exp_dt - midnight_exp).total_seconds() / 86400.0
+
+    full_middle = (expiration_date - today).days - 1
+    if full_middle < 0:
+        full_middle = 0
+
+    total = float(frac_today + full_middle + frac_exp_day)
+    return total, {
+        "branch": "multi_day",
+        "chicago_now": now.isoformat(),
+        "chicago_today": str(today),
+        "frac_today_days": frac_today,
+        "full_middle_calendar_days": float(full_middle),
+        "frac_expiry_date_days": frac_exp_day,
+        "expiry_wall_chi": PH_EXPIRY_WALL_TIME_CHI.isoformat(),
+        "total_days": total,
+    }
+
+
 def wheel_alpha_effective_calendar_dte(expiration_date: dt.date) -> float:
     """
     Calendar days from *now* (Chicago) to expiration, for annualizing premium:
@@ -112,39 +168,25 @@ def wheel_alpha_effective_calendar_dte(expiration_date: dt.date) -> float:
 
     Returns -1.0 if expiration is before today's Chicago date or expiry moment is not after now.
     """
-    now = wheel_calendar_chicago_now()
-    today = now.date()
-    if expiration_date < today:
-        return -1.0
+    total, _ = wheel_alpha_effective_calendar_dte_detail(expiration_date)
+    return total
 
-    exp_dt = dt.datetime.combine(expiration_date, PH_EXPIRY_WALL_TIME_CHI, tzinfo=_CHI)
-    if exp_dt <= now:
-        return -1.0
 
-    if expiration_date == today:
-        return max(
-            (exp_dt - now).total_seconds() / 86400.0,
-            WHEEL_ALPHA_MIN_CALENDAR_DTE_DAYS,
-        )
-
-    midnight_after_today = dt.datetime.combine(
-        today + dt.timedelta(days=1),
-        dt.time(0, 0, 0),
-        tzinfo=_CHI,
+def log_calendar_dte_breakdown(
+    event: str,
+    expiration_date: dt.date,
+    *,
+    detail: tuple[float, dict[str, float | str]] | None = None,
+) -> None:
+    """Emit calendar-DTE total + slice breakdown to stderr and logging (Streamlit Cloud / local)."""
+    total, br = (
+        detail
+        if detail is not None
+        else wheel_alpha_effective_calendar_dte_detail(expiration_date)
     )
-    frac_today = (midnight_after_today - now).total_seconds() / 86400.0
-    frac_today = max(frac_today, WHEEL_ALPHA_MIN_CALENDAR_DTE_DAYS)
-
-    midnight_exp = dt.datetime.combine(
-        expiration_date, dt.time(0, 0, 0), tzinfo=_CHI
-    )
-    frac_exp_day = (exp_dt - midnight_exp).total_seconds() / 86400.0
-
-    full_middle = (expiration_date - today).days - 1
-    if full_middle < 0:
-        full_middle = 0
-
-    return float(frac_today + full_middle + frac_exp_day)
+    msg = f"[{event}] exp={expiration_date} calendar_dte={total:.6f} detail={br!r}"
+    _log.info(msg)
+    print(msg, file=sys.stderr, flush=True)
 
 
 # Clearer name for new code; same implementation as the scanner / CI job.
