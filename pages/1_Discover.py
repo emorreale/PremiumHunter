@@ -18,7 +18,12 @@ from etrade_market import (
     get_quote,
 )
 # Calendar DTE for Mo. Return % + Wheel Alpha: shared with 2_Analyzer + watchlist_snapshot_to_postgres.
-from ph_wheel_calendar_dte import wheel_alpha_effective_calendar_dte
+from ph_wheel_calendar_dte import (
+    log_wheel_calendar_clock,
+    wheel_alpha_effective_calendar_dte,
+    wheel_calendar_chicago_now,
+    wheel_calendar_override_active,
+)
 from watchlist_persist import ensure_session_watchlist, save_watchlist
 
 if st.session_state.get("market") is None:
@@ -1174,6 +1179,8 @@ _scan_rows: list[dict] = []
 _today = _scanner_calendar_today()
 _dte_anchor = _scanner_trading_dte_anchor_date()
 
+log_wheel_calendar_clock("discover_options_scan")
+
 with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
     for exp_date in _selected_expiries:
         try:
@@ -1188,7 +1195,7 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
         # busday_count excludes the start date; +1 when exp > anchor makes the count
         # inclusive through expiration (Mon–Fri; NumPy does not apply exchange holidays).
         # Anchor advances after RTH close / on weekends — trading DTE only. Mo. Return /
-        # Mo. Return / Wheel Alpha: wheel_alpha_effective_calendar_dte (midnight slices + expiry time).
+        # Wheel Alpha: wheel_alpha_effective_calendar_dte (midnight slices + expiry time).
         _raw_dte = int(
             np.busday_count(
                 np.datetime64(_dte_anchor),
@@ -1271,6 +1278,9 @@ with st.spinner(f"Scanning {len(_selected_expiries)} expiration(s)…"):
                     "Volume": int(row.get("Volume", 0) or 0),
                 })
 
+_scan_chi_now = wheel_calendar_chicago_now()
+_scan_chi_override = wheel_calendar_override_active()
+
 _SCAN_COL_ORDER = (
     "Expiration Date",
     "DTE (Trading Days)",
@@ -1339,6 +1349,12 @@ if _scan_rows:
     )
     _scan_styled = _scan_table_styler(_scan_df)
     _scan_h = min(400, 35 * len(_scan_df) + 38)
+    st.caption(
+        f"Calendar span for Mo. Return % / Wheel Alpha uses Chicago: **{_scan_chi_now:%Y-%m-%d %I:%M %p %Z}**"
+        f"{' (PH_CHICAGO_NOW_OVERRIDE)' if _scan_chi_override else ''}. "
+        "Streamlit Cloud still converts the host UTC clock to Central—wrong numbers are usually a "
+        "different bid or a different Chicago calendar day than you expect, not the host region."
+    )
     st.markdown(
         f'<p style="color:#9aa0a6;font-size:0.88rem;margin:2px 0 4px 0">'
         f'{len(_scan_df)} contracts found &nbsp;·&nbsp; '
@@ -1358,6 +1374,11 @@ if _scan_rows:
         height=min(520, _scan_h + 22),
     )
 else:
+    st.caption(
+        f"Calendar span for Mo. Return % / Wheel Alpha uses Chicago: **{_scan_chi_now:%Y-%m-%d %I:%M %p %Z}**"
+        f"{' (PH_CHICAGO_NOW_OVERRIDE)' if _scan_chi_override else ''}. "
+        "Streamlit Cloud uses the host clock converted to Central, not the server’s raw local zone."
+    )
     st.info("No contracts match the selected filters. Try widening the date range or return %.")
 
 # ═══════════════════════════════════════════════════════════════════════════════

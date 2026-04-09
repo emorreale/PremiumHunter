@@ -56,7 +56,10 @@ if str(_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 # Calendar DTE: must match pages/1_Discover.py and pages/2_Analyzer.py (single implementation).
-from ph_wheel_calendar_dte import wheel_alpha_effective_calendar_dte
+from ph_wheel_calendar_dte import (
+    log_wheel_calendar_clock,
+    wheel_alpha_effective_calendar_dte,
+)
 from watchlist_db import normalize_watchlist_symbols
 
 load_dotenv(_ROOT / ".env")
@@ -502,6 +505,7 @@ def main() -> int:
         total_rows = 0
         today = _scan_date_chicago()
         dte_anchor = _trading_dte_anchor_chicago()
+        log_wheel_calendar_clock("watchlist_snapshot_to_postgres")
 
         for sym in symbols:
             print(f"Scanning {sym}…")

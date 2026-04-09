@@ -11,12 +11,22 @@ Effective calendar span from *now* to option expiration (America/Chicago).
 
 Do not reimplement this logic elsewhere; import ``wheel_alpha_effective_calendar_dte`` (alias:
 ``effective_calendar_days_to_expiration``). Expiry clock: ``PH_EXPIRY_WALL_TIME_CHI``.
+
+``wheel_calendar_chicago_now()`` is the clock used (``datetime.now(Chicago)`` by default). Optional
+debug: env or Streamlit secret ``PH_CHICAGO_NOW_OVERRIDE`` = ISO datetime (naive = Chicago local).
+
+Call ``log_wheel_calendar_clock("label")`` from scans to emit UTC / naive local / Chicago to stderr + logging.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import logging
+import os
+import sys
 from zoneinfo import ZoneInfo
+
+_log = logging.getLogger(__name__)
 
 _CHI = ZoneInfo("America/Chicago")
 # Sub-second floor so callers never divide by zero (~1 second as a day fraction).
@@ -24,6 +34,69 @@ WHEEL_ALPHA_MIN_CALENDAR_DTE_DAYS = 1.0 / 86400.0
 
 # Expiration *date* ends at this Chicago wall time (not midnight). Example: Fri exp at noon → 12/24 of that day.
 PH_EXPIRY_WALL_TIME_CHI = dt.time(12, 0, 0)
+
+
+def wheel_calendar_chicago_now() -> dt.datetime:
+    """
+    “Now” in America/Chicago for calendar-DTE math.
+
+    Uses the host clock converted to Chicago (correct on Streamlit Cloud: servers are UTC;
+    this is not “server local wall time”).
+
+    Optional override (debug / demos): ISO string in env ``PH_CHICAGO_NOW_OVERRIDE``, or the
+    same key in ``st.secrets`` on Streamlit. Naive values are interpreted as Chicago local.
+    """
+    raw = (os.environ.get("PH_CHICAGO_NOW_OVERRIDE") or "").strip()
+    if not raw:
+        try:
+            import streamlit as st
+
+            if hasattr(st, "secrets"):
+                sec = st.secrets.get("PH_CHICAGO_NOW_OVERRIDE")
+                if sec is not None and str(sec).strip():
+                    raw = str(sec).strip()
+        except Exception:
+            pass
+    if raw:
+        part = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if part.tzinfo is None:
+            return part.replace(tzinfo=_CHI)
+        return part.astimezone(_CHI)
+    return dt.datetime.now(_CHI)
+
+
+def log_wheel_calendar_clock(event: str = "premiumhunter") -> None:
+    """
+    Log host time perception (UTC, naive process local, America/Chicago used for DTE).
+    Goes to stderr and the premiumhunter.wheel_calendar logger for Streamlit Cloud / CI.
+    """
+    utc = dt.datetime.now(dt.timezone.utc)
+    naive_local = dt.datetime.now()
+    chi = wheel_calendar_chicago_now()
+    ov = wheel_calendar_override_active()
+    msg = (
+        f"[{event}] clock UTC={utc.isoformat()} | "
+        f"process_local_naive={naive_local.isoformat()} | "
+        f"America/Chicago={chi.isoformat()} | "
+        f"TZ_env={os.environ.get('TZ', '')!r} | "
+        f"PH_CHICAGO_NOW_OVERRIDE={ov}"
+    )
+    _log.info(msg)
+    print(msg, file=sys.stderr, flush=True)
+
+
+def wheel_calendar_override_active() -> bool:
+    """True if Mo. Return / calendar DTE use PH_CHICAGO_NOW_OVERRIDE (env or Streamlit secrets)."""
+    if (os.environ.get("PH_CHICAGO_NOW_OVERRIDE") or "").strip():
+        return True
+    try:
+        import streamlit as st
+
+        if hasattr(st, "secrets") and st.secrets.get("PH_CHICAGO_NOW_OVERRIDE"):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def wheel_alpha_effective_calendar_dte(expiration_date: dt.date) -> float:
@@ -39,7 +112,7 @@ def wheel_alpha_effective_calendar_dte(expiration_date: dt.date) -> float:
 
     Returns -1.0 if expiration is before today's Chicago date or expiry moment is not after now.
     """
-    now = dt.datetime.now(_CHI)
+    now = wheel_calendar_chicago_now()
     today = now.date()
     if expiration_date < today:
         return -1.0
