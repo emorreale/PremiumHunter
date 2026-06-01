@@ -14,10 +14,14 @@
 #   ETRADE_TOTP_SECRET        — base32 TOTP secret for 2FA (omit if no 2FA)
 #   DATABASE_IPV4             — explicit IPv4 for hostaddr if DB DNS is IPv6-only
 #
+# Jobs:
+#   watchlist-scan — runs every 30 min during market hours (watchlist symbols only).
+#   universe-scan  — runs twice daily (open + close), scans the full universe.json for the Screener page.
+#
 # OAuth refresh (Playwright + login) runs only when:
 #   • workflow_dispatch (manual), or
 #   • the 7:30 America/Chicago cron (first run of the day).
-# All other scheduled runs (8:00–15:00 every 30 min) only execute the scan; reuse etrade_sessions tokens.
+# All other scheduled runs reuse etrade_sessions tokens.
 # If a later run fails with auth errors, run the workflow manually once to refresh.
 #
 name: Watchlist scan → Postgres
@@ -25,16 +29,19 @@ name: Watchlist scan → Postgres
 on:
   workflow_dispatch:
   schedule:
-    # 7:30 CT = token refresh + scan; 8:00–14:30 every 30m = scan only; 15:00 = last scan.
+    # 7:30 CT = token refresh + watchlist scan + universe scan
     - cron: "30 7 * * 1-5"
       timezone: "America/Chicago"
+    # 8:00–14:30 every 30m = watchlist scan only
     - cron: "0,30 8-14 * * 1-5"
       timezone: "America/Chicago"
+    # 15:00 CT = last watchlist scan + universe scan
     - cron: "0 15 * * 1-5"
       timezone: "America/Chicago"
 
 jobs:
-  sync:
+  # ─── Watchlist scan (every 30 min during market hours) ───────────────────────
+  watchlist-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -78,7 +85,6 @@ jobs:
           path: etrade_token_debug.png
           if-no-files-found: ignore
 
-      # Mo. Return / Wheel Alpha calendar DTE = ph_wheel_calendar_dte (same as Streamlit Discover + Analyzer).
       - name: Run watchlist scan + Wheel Alpha
         env:
           DATABASE_FORCE_IPV4: "1"
@@ -87,6 +93,40 @@ jobs:
           ETRADE_CONSUMER_KEY: ${{ secrets.ETRADE_CONSUMER_KEY }}
           ETRADE_CONSUMER_SECRET: ${{ secrets.ETRADE_CONSUMER_SECRET }}
           ETRADE_SANDBOX: ${{ secrets.ETRADE_SANDBOX }}
-          # Omit WATCHLIST_JSON when watchlists has at least one row (scan merges symbols from every owner).
           WATCHLIST_JSON: ${{ secrets.WATCHLIST_JSON }}
+        run: python scripts/watchlist_snapshot_to_postgres.py
+
+  # ─── Universe scan (first + last run of the day for Screener) ────────────────
+  universe-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '30 7 * * 1-5' ||
+      github.event.schedule == '0 15 * * 1-5'
+    needs: watchlist-scan
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements-ci.txt
+
+      - name: Run universe scan + Wheel Alpha (Screener)
+        env:
+          DATABASE_FORCE_IPV4: "1"
+          DATABASE_IPV4: ${{ secrets.DATABASE_IPV4 }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ETRADE_CONSUMER_KEY: ${{ secrets.ETRADE_CONSUMER_KEY }}
+          ETRADE_CONSUMER_SECRET: ${{ secrets.ETRADE_CONSUMER_SECRET }}
+          ETRADE_SANDBOX: ${{ secrets.ETRADE_SANDBOX }}
+          UNIVERSE_FILE: universe.json
         run: python scripts/watchlist_snapshot_to_postgres.py
