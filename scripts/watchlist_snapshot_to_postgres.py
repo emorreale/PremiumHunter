@@ -16,16 +16,18 @@ Required env:
   ETRADE_CONSUMER_KEY, ETRADE_CONSUMER_SECRET
   ETRADE_SANDBOX        — "true" or "false"
 
-Watchlist source (in priority order):
-  1. WATCHLIST_FILE     — local JSON path (if set, skips DB + secret).
-  2. watchlists table   — merge symbols from every row (all owners), deduped; if table has no rows, fall back.
-  3. WATCHLIST_JSON     — env / secret fallback, e.g. ["AAPL","NVDA"]
+Symbol source (in priority order):
+  1. UNIVERSE_FILE     — broad universe JSON path (e.g. universe.json); scans all tickers for screener.
+  2. WATCHLIST_FILE    — local JSON path (if set, skips DB + secret).
+  3. watchlists table  — merge symbols from every row (all owners), deduped; if table has no rows, fall back.
+  4. WATCHLIST_JSON    — env / secret fallback, e.g. ["AAPL","NVDA"]
 
 Token source (in priority order):
   1. ETRADE_OAUTH_TOKEN + ETRADE_OAUTH_TOKEN_SECRET env vars (legacy / manual).
   2. Most-recent row from etrade_sessions table (written by etrade_token_refresh.py).
 
 Optional:
+  UNIVERSE_FILE         — path to broad-universe JSON; highest priority symbol source for screener scans
   WATCHLIST_FILE        — path to JSON file; overrides DB and WATCHLIST_JSON
   DATABASE_FORCE_IPV4   — if "1"/"true"/"yes", resolve DB host to IPv4 and set libpq hostaddr
                           (GitHub-hosted runners often cannot reach IPv6-only / AAAA-first hosts)
@@ -276,6 +278,22 @@ def _load_symbols_from_db_all(conn) -> list[str] | None:
 
 
 def _load_symbols(conn) -> list[str]:
+    # Priority 1: UNIVERSE_FILE (broad screener universe)
+    uf = os.environ.get("UNIVERSE_FILE", "").strip()
+    if uf:
+        p = Path(uf)
+        if not p.is_file():
+            print(f"UNIVERSE_FILE not found: {uf}", file=sys.stderr)
+            sys.exit(1)
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, list) and not isinstance(raw, dict):
+            print("Universe file must be a JSON array or {tickers: [...]}", file=sys.stderr)
+            sys.exit(1)
+        syms = normalize_watchlist_symbols(raw)
+        print(f"Using UNIVERSE_FILE ({len(syms)} symbol(s)): {uf}")
+        return syms
+
+    # Priority 2: WATCHLIST_FILE
     fp = os.environ.get("WATCHLIST_FILE", "").strip()
     if fp:
         p = Path(fp)
@@ -288,11 +306,13 @@ def _load_symbols(conn) -> list[str]:
             sys.exit(1)
         return normalize_watchlist_symbols(raw)
 
+    # Priority 3: watchlists table (all owners merged)
     from_db = _load_symbols_from_db_all(conn)
     if from_db is not None:
         print(f"Using merged watchlist from Postgres ({len(from_db)} unique symbol(s), all owners).")
         return from_db
 
+    # Priority 4: WATCHLIST_JSON env var
     raw_s = (os.environ.get("WATCHLIST_JSON") or "[]").strip() or "[]"
     raw = json.loads(raw_s)
     if not isinstance(raw, list) and not isinstance(raw, dict):

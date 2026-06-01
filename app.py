@@ -583,8 +583,13 @@ analyzer_page = st.Page(
     title="Analyzer",
     url_path="analyzer",
 )
+screener_page = st.Page(
+    "pages/3_Screener.py",
+    title="Screener",
+    url_path="screener",
+)
 
-pg = st.navigation([discover_page, analyzer_page], position="top")
+pg = st.navigation([discover_page, analyzer_page, screener_page], position="top")
 
 # ── Market index ticker tape (Discover only; hidden on Analyzer) ───────────
 # Yahoo symbols drive the tape numbers; E*Trade needs plain equity/ETF tickers
@@ -639,7 +644,7 @@ def _fetch_indices() -> list[dict]:
     return results
 
 
-if pg.url_path != "analyzer":
+if pg.url_path not in ("analyzer", "screener"):
     _idx_data = _fetch_indices()
 
     _tape_cols = st.columns(len(_idx_data))
