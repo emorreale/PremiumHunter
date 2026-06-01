@@ -2,6 +2,7 @@ import datetime as dt
 import html
 import math
 import re
+import time
 import uuid
 
 import numpy as np
@@ -103,28 +104,36 @@ def _cached_yf_info(symbol: str) -> dict:
         return {}
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def _cached_next_earnings_date_str(symbol: str) -> str:
-    """Next upcoming earnings date (YYYY-MM-DD, US/Eastern calendar day), or ""."""
-    sym = (symbol or "").strip().upper()
-    if not sym:
-        return ""
+def _fetch_next_earnings_date(sym: str) -> str:
+    """Single attempt to resolve next earnings date from Yahoo Finance."""
     today = dt.date.today()
     try:
         tk = yf.Ticker(sym)
         cal = tk.calendar
-        if isinstance(cal, dict):
+        # tk.calendar may be a dict or a DataFrame depending on yfinance version.
+        if isinstance(cal, pd.DataFrame):
+            if "Earnings Date" in cal.columns:
+                eds = cal["Earnings Date"].dropna().tolist()
+            elif "Earnings Date" in cal.index:
+                eds = cal.loc["Earnings Date"].dropna().tolist()
+            else:
+                eds = []
+        elif isinstance(cal, dict):
             eds = cal.get("Earnings Date")
-            if eds is not None and eds != "":
-                if not isinstance(eds, (list, tuple)):
-                    eds = [eds]
-                for d in eds:
-                    if isinstance(d, dt.datetime):
-                        d = d.date()
-                    elif isinstance(d, pd.Timestamp):
-                        d = d.date()
-                    if isinstance(d, dt.date) and d >= today:
-                        return d.strftime("%Y-%m-%d")
+            if eds is None or eds == "":
+                eds = []
+            elif not isinstance(eds, (list, tuple)):
+                eds = [eds]
+        else:
+            eds = []
+        for d in eds:
+            if isinstance(d, dt.datetime):
+                d = d.date()
+            elif isinstance(d, pd.Timestamp):
+                d = d.date()
+            if isinstance(d, dt.date) and d >= today:
+                return d.strftime("%Y-%m-%d")
+
         edf = tk.get_earnings_dates(limit=20)
         if edf is not None and not edf.empty:
             for ts in sorted(edf.index):
@@ -136,6 +145,7 @@ def _cached_next_earnings_date_str(symbol: str) -> str:
                 )
                 if d >= today:
                     return d.strftime("%Y-%m-%d")
+
         inf = _cached_yf_info(sym)
         ts = (
             inf.get("earningsTimestamp")
@@ -152,6 +162,23 @@ def _cached_next_earnings_date_str(symbol: str) -> str:
     except Exception:
         pass
     return ""
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_next_earnings_date_str(symbol: str) -> str:
+    """Next upcoming earnings date (YYYY-MM-DD, US/Eastern calendar day), or "".
+
+    Retries once after a short delay if the first attempt returns empty (handles
+    transient Yahoo rate limits / network blips).
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return ""
+    result = _fetch_next_earnings_date(sym)
+    if result:
+        return result
+    time.sleep(1.5)
+    return _fetch_next_earnings_date(sym)
 
 
 @st.cache_data(ttl=120, show_spinner=False)
