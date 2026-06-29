@@ -20,6 +20,11 @@ from dotenv import load_dotenv
 _ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_ROOT / ".env")
 
+# A universe scan run can take up to ~45 min, so rows within one run have a spread of
+# create_ts values. Rows within this window of the most recent create_ts are treated as
+# belonging to the same (latest) scan batch.
+PH_LATEST_SCAN_WINDOW_MIN = 90
+
 # ── DB connection ────────────────────────────────────────────────────────────
 
 def _get_connection():
@@ -49,10 +54,51 @@ def _get_connection():
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _load_last_scan_time() -> dt.datetime | None:
+    """Most recent create_ts across all scans (America/Chicago wall time, naive)."""
+    database_url = (os.environ.get("DATABASE_URL") or "").strip()
+    if not database_url:
+        return None
+
+    try:
+        import psycopg
+        from watchlist_db import prepare_psycopg_dsn
+    except ImportError:
+        return None
+
+    dsn = prepare_psycopg_dsn(database_url)
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT MAX(create_ts) FROM options_scans")
+                row = cur.fetchone()
+    except Exception:
+        return None
+
+    if not row or row[0] is None:
+        return None
+    return row[0]
+
+
+def _time_clause(latest_only: bool, max_age_hours: int, params: dict) -> str:
+    """Build the create_ts WHERE clause and populate params for either mode."""
+    if latest_only:
+        params["window"] = PH_LATEST_SCAN_WINDOW_MIN
+        return (
+            "AND create_ts >= "
+            "(SELECT MAX(create_ts) FROM options_scans) "
+            "- (%(window)s * INTERVAL '1 minute')"
+        )
+    params["cutoff"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age_hours)
+    return "AND create_ts >= %(cutoff)s"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _load_scans(
     strategy_filter: str,
     min_alpha: float,
     max_age_hours: int,
+    latest_only: bool,
 ) -> pd.DataFrame:
     """Load recent option scans from Postgres, filtered server-side."""
     database_url = (os.environ.get("DATABASE_URL") or "").strip()
@@ -66,13 +112,11 @@ def _load_scans(
         return pd.DataFrame()
 
     dsn = prepare_psycopg_dsn(database_url)
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age_hours)
+
+    params: dict = {"min_alpha": min_alpha}
+    time_clause = _time_clause(latest_only, max_age_hours, params)
 
     strategy_clause = ""
-    params: dict = {
-        "min_alpha": min_alpha,
-        "cutoff": cutoff,
-    }
     if strategy_filter != "All":
         strategy_clause = "AND strategy = %(strategy)s"
         params["strategy"] = (
@@ -96,7 +140,7 @@ def _load_scans(
             create_ts
         FROM options_scans
         WHERE wheel_alpha >= %(min_alpha)s
-          AND create_ts >= %(cutoff)s
+          {time_clause}
           {strategy_clause}
         ORDER BY wheel_alpha DESC
         LIMIT 500
@@ -117,7 +161,7 @@ def _load_scans(
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _load_top_tickers(max_age_hours: int) -> pd.DataFrame:
+def _load_top_tickers(max_age_hours: int, latest_only: bool) -> pd.DataFrame:
     """Per-symbol best Wheel Alpha (top-3 average) from recent scans."""
     database_url = (os.environ.get("DATABASE_URL") or "").strip()
     if not database_url:
@@ -130,9 +174,11 @@ def _load_top_tickers(max_age_hours: int) -> pd.DataFrame:
         return pd.DataFrame()
 
     dsn = prepare_psycopg_dsn(database_url)
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age_hours)
 
-    query = """
+    params: dict = {}
+    time_clause = _time_clause(latest_only, max_age_hours, params)
+
+    query = f"""
         WITH ranked AS (
             SELECT
                 symbol,
@@ -142,7 +188,7 @@ def _load_top_tickers(max_age_hours: int) -> pd.DataFrame:
                 ROW_NUMBER() OVER (PARTITION BY symbol, strategy ORDER BY wheel_alpha DESC) AS rn
             FROM options_scans
             WHERE wheel_alpha IS NOT NULL
-              AND create_ts >= %(cutoff)s
+              {time_clause}
         )
         SELECT
             symbol,
@@ -158,7 +204,7 @@ def _load_top_tickers(max_age_hours: int) -> pd.DataFrame:
     try:
         with psycopg.connect(dsn) as conn:
             with conn.cursor() as cur:
-                cur.execute(query, {"cutoff": cutoff})
+                cur.execute(query, params)
                 cols = [desc[0] for desc in cur.description]
                 rows = cur.fetchall()
     except Exception:
@@ -181,6 +227,21 @@ st.caption(
     "Run the snapshot script with `UNIVERSE_FILE=universe.json` to populate data."
 )
 
+_last_scan = _load_last_scan_time()
+if _last_scan is not None:
+    st.markdown(
+        f'<p style="color:#9aa0a6;font-size:0.85rem;margin:0 0 4px 0">'
+        f'Last scan: <span style="color:#c9d1d9;font-weight:600">'
+        f'{_last_scan.strftime("%b %d, %Y · %I:%M %p")} CT</span></p>',
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        '<p style="color:#9aa0a6;font-size:0.85rem;margin:0 0 4px 0">'
+        'Last scan: <span style="color:#c9d1d9;font-weight:600">no data yet</span></p>',
+        unsafe_allow_html=True,
+    )
+
 # Filters
 _f1, _f2, _f3, _f4 = st.columns([1.2, 1.2, 1.0, 1.0])
 
@@ -192,13 +253,15 @@ with _f1:
     )
 
 with _f2:
-    age_hours = st.selectbox(
+    freshness = st.selectbox(
         "Scan freshness",
-        options=[6, 12, 24, 48, 72],
-        index=2,
-        format_func=lambda h: f"Last {h}h",
+        options=["Latest scan", 6, 12, 24, 48, 72],
+        index=0,
+        format_func=lambda h: h if isinstance(h, str) else f"Last {h}h",
         key="ph_scr_age",
     )
+    latest_only = freshness == "Latest scan"
+    age_hours = 24 if latest_only else int(freshness)
 
 with _f3:
     min_alpha = st.number_input(
@@ -250,7 +313,7 @@ def _strategy_label(s: str) -> str:
 
 if view_mode == "Top Tickers":
     with st.spinner("Loading leaderboard…"):
-        top_df = _load_top_tickers(int(age_hours))
+        top_df = _load_top_tickers(int(age_hours), latest_only)
 
     if top_df.empty:
         st.info(
@@ -306,7 +369,7 @@ if view_mode == "Top Tickers":
 
 else:
     with st.spinner("Loading contracts…"):
-        contracts_df = _load_scans(strategy_pick, min_alpha, int(age_hours))
+        contracts_df = _load_scans(strategy_pick, min_alpha, int(age_hours), latest_only)
 
     if contracts_df.empty:
         st.info(
@@ -386,7 +449,8 @@ Great for picking *which* stocks to look at.
 **All Contracts** — Every individual contract that scored above your minimum, sorted by
 Wheel Alpha. Use this to find specific strikes/expirations to trade.
 
-**Freshness** — Controls how far back to look. "Last 24h" means only scans from the past
-day are included; older data is ignored.
-"""
+**Freshness** — Controls how far back to look. **Latest scan** (the default) shows only the
+most recent scan batch (rows within {window} minutes of the newest timestamp, since one
+universe run spans up to ~45 min). "Last 24h" instead includes every scan from the past day.
+""".format(window=PH_LATEST_SCAN_WINDOW_MIN)
     )
