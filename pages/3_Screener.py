@@ -25,6 +25,11 @@ load_dotenv(_ROOT / ".env")
 # belonging to the same (latest) scan batch.
 PH_LATEST_SCAN_WINDOW_MIN = 90
 
+# The options_scans table is written by BOTH the universe scan (Screener) and the every-30-min
+# watchlist scan. The Screener must only ever read universe rows, otherwise "Latest scan" picks
+# up the more-frequent watchlist run. Written by watchlist_snapshot_to_postgres.py (scan_type).
+PH_SCREENER_SCAN_TYPE = "universe"
+
 # ── DB connection ────────────────────────────────────────────────────────────
 
 def _get_connection():
@@ -70,7 +75,10 @@ def _load_last_scan_time() -> dt.datetime | None:
     try:
         with psycopg.connect(dsn) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT MAX(create_ts) FROM options_scans")
+                cur.execute(
+                    "SELECT MAX(create_ts) FROM options_scans WHERE scan_type = %(scan_type)s",
+                    {"scan_type": PH_SCREENER_SCAN_TYPE},
+                )
                 row = cur.fetchone()
     except Exception:
         return None
@@ -81,12 +89,17 @@ def _load_last_scan_time() -> dt.datetime | None:
 
 
 def _time_clause(latest_only: bool, max_age_hours: int, params: dict) -> str:
-    """Build the create_ts WHERE clause and populate params for either mode."""
+    """Build the create_ts WHERE clause and populate params for either mode.
+
+    The latest-scan subquery is scoped to universe rows so it does not lock onto a more
+    recent watchlist scan.
+    """
+    params["scan_type"] = PH_SCREENER_SCAN_TYPE
     if latest_only:
         params["window"] = PH_LATEST_SCAN_WINDOW_MIN
         return (
             "AND create_ts >= "
-            "(SELECT MAX(create_ts) FROM options_scans) "
+            "(SELECT MAX(create_ts) FROM options_scans WHERE scan_type = %(scan_type)s) "
             "- (%(window)s * INTERVAL '1 minute')"
         )
     params["cutoff"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age_hours)
@@ -140,6 +153,7 @@ def _load_scans(
             create_ts
         FROM options_scans
         WHERE wheel_alpha >= %(min_alpha)s
+          AND scan_type = %(scan_type)s
           {time_clause}
           {strategy_clause}
         ORDER BY wheel_alpha DESC
@@ -188,6 +202,7 @@ def _load_top_tickers(max_age_hours: int, latest_only: bool) -> pd.DataFrame:
                 ROW_NUMBER() OVER (PARTITION BY symbol, strategy ORDER BY wheel_alpha DESC) AS rn
             FROM options_scans
             WHERE wheel_alpha IS NOT NULL
+              AND scan_type = %(scan_type)s
               {time_clause}
         )
         SELECT

@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS options_scans (
     earn_date   DATE,
     gamma       NUMERIC,
     wheel_alpha NUMERIC,
+    scan_type   VARCHAR(16),  -- 'universe' (Screener) or 'watchlist' (per-owner scan)
     create_ts   TIMESTAMP(0) DEFAULT (date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)
 );
 
@@ -40,6 +41,7 @@ CREATE INDEX IF NOT EXISTS idx_options_scans_session ON options_scans (session_i
 CREATE INDEX IF NOT EXISTS idx_options_scans_symbol ON options_scans (symbol);
 CREATE INDEX IF NOT EXISTS idx_options_scans_expiry ON options_scans (expiry);
 CREATE INDEX IF NOT EXISTS idx_options_scans_wheel_alpha ON options_scans (wheel_alpha DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_options_scans_scan_type ON options_scans (scan_type);
 
 -- ── Existing databases (idempotent where possible) ───────────────────────────
 DO $$
@@ -81,6 +83,9 @@ ALTER TABLE options_scans ADD COLUMN IF NOT EXISTS wheel_alpha NUMERIC;
 ALTER TABLE options_scans ADD COLUMN IF NOT EXISTS session_id INTEGER;
 ALTER TABLE options_scans ADD COLUMN IF NOT EXISTS underlying_price NUMERIC;
 ALTER TABLE options_scans ADD COLUMN IF NOT EXISTS earn_date DATE;
+ALTER TABLE options_scans ADD COLUMN IF NOT EXISTS scan_type VARCHAR(16);
+
+CREATE INDEX IF NOT EXISTS idx_options_scans_scan_type ON options_scans (scan_type);
 
 DO $$
 BEGIN

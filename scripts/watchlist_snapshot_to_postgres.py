@@ -383,14 +383,15 @@ def _insert_scan_row(
     earn_date: dt.date | None,
     gamma_val: float | None,
     wheel_alpha: float,
+    scan_type: str,
 ) -> None:
     scan_id = str(uuid.uuid4())
     cur.execute(
         """
         INSERT INTO options_scans
             (session_id, scan_id, symbol, strategy, strike, underlying_price, expiry, dte,
-             otm_pct, mo_yield, iv, iv_rank, earn_date, gamma, wheel_alpha)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             otm_pct, mo_yield, iv, iv_rank, earn_date, gamma, wheel_alpha, scan_type)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             session_id,
@@ -408,6 +409,7 @@ def _insert_scan_row(
             earn_date,
             gamma_val,
             wheel_alpha,
+            scan_type,
         ),
     )
 
@@ -485,6 +487,9 @@ def main() -> int:
         print("Install psycopg: pip install 'psycopg[binary]'", file=sys.stderr)
         return 1
 
+    # Tag rows so the Screener can isolate universe scans from the every-30-min watchlist scans.
+    scan_type = "universe" if os.environ.get("UNIVERSE_FILE", "").strip() else "watchlist"
+
     dsn = _prepare_psycopg_dsn(database_url)
     with psycopg.connect(dsn) as conn:
         _ensure_tables(conn)
@@ -492,6 +497,7 @@ def main() -> int:
         if not symbols:
             print("No symbols to sync (empty watchlist).")
             return 0
+        print(f"Scan type: {scan_type}")
 
         tok = (os.environ.get("ETRADE_OAUTH_TOKEN") or "").strip()
         sec = (os.environ.get("ETRADE_OAUTH_TOKEN_SECRET") or "").strip()
@@ -627,6 +633,7 @@ def main() -> int:
                                 earn_date=earn_d,
                                 gamma_val=round(float(gamma_val), 6) if gamma_val is not None else None,
                                 wheel_alpha=round(float(wa), 1),
+                                scan_type=scan_type,
                             )
                             total_rows += 1
             conn.commit()
