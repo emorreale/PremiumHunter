@@ -16,7 +16,9 @@
 #
 # Jobs:
 #   watchlist-scan — runs every 30 min during market hours (watchlist symbols only).
-#   universe-scan  — runs twice daily (first run + midday), scans the full universe.json for the Screener page.
+#   universe-scan  — runs twice daily (8:00 + midday), scans the full universe.json for the Screener page.
+#                    The 8:00 run is the second watchlist scan of the day, so the universe scan
+#                    lands after the market is open (not the 7:30 pre-market token-refresh run).
 #
 # OAuth refresh (Playwright + login) runs only when:
 #   • workflow_dispatch (manual), or
@@ -24,8 +26,8 @@
 # All other scheduled runs reuse etrade_sessions tokens.
 # If a later run fails with auth errors, run the workflow manually once to refresh.
 #
-# Note: noon (12:00 CT) has its own cron entry so the universe-scan job can detect midday
-# via github.event.schedule (the every-30-min entry deliberately skips 12:00 to avoid a
+# Note: 8:00 and 12:00 CT each have their own cron entry so the universe-scan job can detect them
+# via github.event.schedule (the every-30-min entries deliberately skip those minutes to avoid a
 # duplicate trigger at the same minute).
 #
 name: Watchlist scan → Postgres
@@ -33,11 +35,16 @@ name: Watchlist scan → Postgres
 on:
   workflow_dispatch:
   schedule:
-    # 7:30 CT = token refresh + watchlist scan + universe scan (first run)
+    # 7:30 CT = token refresh + watchlist scan (pre-market)
     - cron: "30 7 * * 1-5"
       timezone: "America/Chicago"
-    # 8:00–11:30 every 30m = watchlist scan only
-    - cron: "0,30 8-11 * * 1-5"
+    # 8:00 CT = watchlist scan + universe scan (initial universe scan, market open)
+    - cron: "0 8 * * 1-5"
+      timezone: "America/Chicago"
+    # 8:30–11:30 every 30m = watchlist scan only
+    - cron: "30 8 * * 1-5"
+      timezone: "America/Chicago"
+    - cron: "0,30 9-11 * * 1-5"
       timezone: "America/Chicago"
     # 12:00 CT = watchlist scan + universe scan (midday)
     - cron: "0 12 * * 1-5"
@@ -109,13 +116,13 @@ jobs:
           WATCHLIST_JSON: ${{ secrets.WATCHLIST_JSON }}
         run: python scripts/watchlist_snapshot_to_postgres.py
 
-  # ─── Universe scan (first run + midday for Screener) ─────────────────────────
+  # ─── Universe scan (8:00 market-open + midday for Screener) ──────────────────
   universe-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.schedule == '30 7 * * 1-5' ||
+      github.event.schedule == '0 8 * * 1-5' ||
       github.event.schedule == '0 12 * * 1-5'
     needs: watchlist-scan
 
