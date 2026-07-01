@@ -328,10 +328,82 @@ _SQL_TS_CHICAGO_SEC = (
 )
 
 
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split a SQL script into individual statements on top-level semicolons.
+
+    Respects $$-dollar-quoted blocks (e.g. DO $$ ... $$;), single-quoted string
+    literals, and -- line comments so their semicolons are not treated as
+    statement terminators. Executing statements one at a time (rather than the whole
+    script in one execute()) ensures a CREATE INDEX sees a column added by an earlier
+    ALTER TABLE ... ADD COLUMN — the whole-script execute analyzes every statement up
+    front, so the index cannot see the not-yet-created column.
+    """
+    stmts: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(sql)
+    dollar: str | None = None  # active dollar-quote tag, e.g. "$$"
+    in_squote = False          # inside a '...' string literal
+    while i < n:
+        ch = sql[i]
+        if dollar is not None:
+            if sql.startswith(dollar, i):
+                buf.append(dollar)
+                i += len(dollar)
+                dollar = None
+            else:
+                buf.append(ch)
+                i += 1
+            continue
+        if in_squote:
+            buf.append(ch)
+            if ch == "'":
+                in_squote = False
+            i += 1
+            continue
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            eol = sql.find("\n", i)
+            if eol == -1:
+                eol = n
+            buf.append(sql[i:eol])
+            i = eol
+            continue
+        if ch == "$":
+            j = sql.find("$", i + 1)
+            if j != -1:
+                inner = sql[i + 1:j]
+                if inner == "" or inner.isidentifier():
+                    dollar = sql[i:j + 1]
+                    buf.append(dollar)
+                    i = j + 1
+                    continue
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "'":
+            in_squote = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ";":
+            stmt = "".join(buf).strip()
+            if stmt:
+                stmts.append(stmt)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        stmts.append(tail)
+    return stmts
+
+
 def _ensure_tables(conn) -> None:
     schema_sql = (Path(__file__).resolve().parent / "schema_watchlist_snapshots.sql").read_text()
     with conn.cursor() as cur:
-        cur.execute(schema_sql)
+        for stmt in _split_sql_statements(schema_sql):
+            cur.execute(stmt)
     conn.commit()
 
 
