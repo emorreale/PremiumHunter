@@ -41,7 +41,8 @@ CREATE INDEX IF NOT EXISTS idx_options_scans_session ON options_scans (session_i
 CREATE INDEX IF NOT EXISTS idx_options_scans_symbol ON options_scans (symbol);
 CREATE INDEX IF NOT EXISTS idx_options_scans_expiry ON options_scans (expiry);
 CREATE INDEX IF NOT EXISTS idx_options_scans_wheel_alpha ON options_scans (wheel_alpha DESC NULLS LAST);
-CREATE INDEX IF NOT EXISTS idx_options_scans_scan_type ON options_scans (scan_type);
+-- Note: idx_options_scans_scan_type is created after the ADD COLUMN migration below,
+-- so it also works on pre-existing tables where CREATE TABLE IF NOT EXISTS is a no-op.
 
 -- ── Existing databases (idempotent where possible) ───────────────────────────
 DO $$
