@@ -529,14 +529,29 @@ def main() -> int:
         today = _scan_date_chicago()
         dte_anchor = _trading_dte_anchor_chicago()
 
+        # Batch all equity quotes up front (E*Trade allows 25 symbols/call) instead of one
+        # call per symbol. Falls back to a per-symbol quote if a symbol is missing from the batch.
+        try:
+            quotes = em.get_equity_quotes_batch(market, symbols)
+            print(f"Fetched batch quotes for {len(quotes)}/{len(symbols)} symbol(s).")
+        except Exception as e:
+            print(f"Batch quote fetch failed ({e}); using per-symbol quotes.", file=sys.stderr)
+            quotes = {}
+
         for sym in symbols:
             print(f"Scanning {sym}…")
+            q = quotes.get(sym.upper().strip())
+            if q is None:
+                try:
+                    q = em.get_quote(market, sym)
+                except Exception as e:
+                    print(f"  {sym}: quote failed ({e}), skipping", file=sys.stderr)
+                    continue
             try:
-                q = em.get_quote(market, sym)
                 price, _ = em.get_equity_display_price(q)
                 spot = float(price) if price is not None else 0.0
             except Exception as e:
-                print(f"  {sym}: quote failed ({e}), skipping", file=sys.stderr)
+                print(f"  {sym}: quote parse failed ({e}), skipping", file=sys.stderr)
                 continue
             if spot <= 0:
                 print(f"  {sym}: no valid price, skipping")
@@ -577,65 +592,67 @@ def main() -> int:
                     trading_dte = raw_bus + 1 if exp_date > dte_anchor else raw_bus
                     if trading_dte <= 0:
                         continue
-                    for chain_type, is_put in (("PUT", True), ("CALL", False)):
+                    # One call returns BOTH puts and calls (chain_type=None); the response's
+                    # Type column tells us each row's side, so we avoid a second API call.
+                    try:
+                        chain = em.get_option_chain(market, sym, expiry_date=exp_date, chain_type=None)
+                    except Exception as e:
+                        print(f"  {sym} {exp_date}: chain failed ({e})", file=sys.stderr)
+                        continue
+                    if chain.empty:
+                        continue
+                    for _, row in chain.iterrows():
+                        is_put = str(row.get("Type", "")).strip().lower() == "put"
+                        bid = float(row.get("Bid", 0) or 0)
+                        strike = float(row.get("Strike", 0) or 0)
+                        if strike <= 0 or bid <= 0:
+                            continue
+                        # Same as Discover: OTM puts → strike below spot (negative %); OTM calls → positive %.
+                        otm_pct = ((strike / spot) - 1.0) * 100.0 if spot > 0 else 0.0
+                        if is_put and otm_pct >= 0:
+                            continue
+                        if (not is_put) and otm_pct <= 0:
+                            continue
+                        # CSP and covered calls: premium / strike (CC = true return on capital at short strike).
+                        raw_return = bid / strike
+                        mo_yield = raw_return * (PH_AVG_CALENDAR_DAYS_PER_MONTH / calendar_dte) * 100.0
+                        if mo_yield <= PH_SYNC_MIN_MO_YIELD_PCT:
+                            continue
+                        iv_dec = _scan_iv_to_decimal(row.get("IV"))
+                        iv_stored = _iv_chain_numeric(row.get("IV"))
+                        iv_rank_val = _iv_rank_pct(iv_dec, iv_lo, iv_hi)
+                        gamma_raw = row.get("Gamma", 0) or 0
                         try:
-                            chain = em.get_option_chain(market, sym, expiry_date=exp_date, chain_type=chain_type)
-                        except Exception as e:
-                            print(f"  {sym} {exp_date} {chain_type}: chain failed ({e})", file=sys.stderr)
+                            gamma_val = float(gamma_raw) if gamma_raw else None
+                        except (TypeError, ValueError):
+                            gamma_val = None
+                        wa = _calculate_wheel_alpha(
+                            mo_yield, otm_pct, calendar_dte, iv_dec, iv_rank_val, strike,
+                            cost_basis=spot if not is_put else None,
+                            is_put=is_put,
+                        )
+                        if not (wa == wa and np.isfinite(wa)):
                             continue
-                        if chain.empty:
-                            continue
-                        for _, row in chain.iterrows():
-                            bid = float(row.get("Bid", 0) or 0)
-                            strike = float(row.get("Strike", 0) or 0)
-                            if strike <= 0 or bid <= 0:
-                                continue
-                            # Same as Discover: OTM puts → strike below spot (negative %); OTM calls → positive %.
-                            otm_pct = ((strike / spot) - 1.0) * 100.0 if spot > 0 else 0.0
-                            if is_put and otm_pct >= 0:
-                                continue
-                            if (not is_put) and otm_pct <= 0:
-                                continue
-                            # CSP and covered calls: premium / strike (CC = true return on capital at short strike).
-                            raw_return = bid / strike
-                            mo_yield = raw_return * (PH_AVG_CALENDAR_DAYS_PER_MONTH / calendar_dte) * 100.0
-                            if mo_yield <= PH_SYNC_MIN_MO_YIELD_PCT:
-                                continue
-                            iv_dec = _scan_iv_to_decimal(row.get("IV"))
-                            iv_stored = _iv_chain_numeric(row.get("IV"))
-                            iv_rank_val = _iv_rank_pct(iv_dec, iv_lo, iv_hi)
-                            gamma_raw = row.get("Gamma", 0) or 0
-                            try:
-                                gamma_val = float(gamma_raw) if gamma_raw else None
-                            except (TypeError, ValueError):
-                                gamma_val = None
-                            wa = _calculate_wheel_alpha(
-                                mo_yield, otm_pct, calendar_dte, iv_dec, iv_rank_val, strike,
-                                cost_basis=spot if not is_put else None,
-                                is_put=is_put,
-                            )
-                            if not (wa == wa and np.isfinite(wa)):
-                                continue
-                            strat = "cash_secured_put" if is_put else "covered_call"
-                            _insert_scan_row(
-                                cur,
-                                session_id=session_id,
-                                symbol=sym,
-                                strategy=strat,
-                                strike=strike,
-                                underlying_price=round(spot, 2),
-                                expiry=exp_date,
-                                dte=trading_dte,
-                                otm_pct=round(otm_pct, 2),
-                                mo_yield=round(mo_yield, 2),
-                                iv=round(float(iv_stored), 6) if iv_stored is not None else None,
-                                iv_rank_val=round(float(iv_rank_val), 1) if iv_rank_val is not None else None,
-                                earn_date=earn_d,
-                                gamma_val=round(float(gamma_val), 6) if gamma_val is not None else None,
-                                wheel_alpha=round(float(wa), 1),
-                                scan_type=scan_type,
-                            )
-                            total_rows += 1
+                        strat = "cash_secured_put" if is_put else "covered_call"
+                        _insert_scan_row(
+                            cur,
+                            session_id=session_id,
+                            symbol=sym,
+                            strategy=strat,
+                            strike=strike,
+                            underlying_price=round(spot, 2),
+                            expiry=exp_date,
+                            dte=trading_dte,
+                            otm_pct=round(otm_pct, 2),
+                            mo_yield=round(mo_yield, 2),
+                            iv=round(float(iv_stored), 6) if iv_stored is not None else None,
+                            iv_rank_val=round(float(iv_rank_val), 1) if iv_rank_val is not None else None,
+                            earn_date=earn_d,
+                            gamma_val=round(float(gamma_val), 6) if gamma_val is not None else None,
+                            wheel_alpha=round(float(wa), 1),
+                            scan_type=scan_type,
+                        )
+                        total_rows += 1
             conn.commit()
             print(f"  {sym}: committed rows so far: {total_rows}")
 
