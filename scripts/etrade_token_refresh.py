@@ -215,6 +215,23 @@ def _verifier_from_url(url: str) -> str | None:
     return None
 
 
+def _goto_resilient(page, url: str, *, timeout: int = 90000) -> None:
+    """Navigate, retrying once. E*Trade's CDN often breaks HTTP/2 from GitHub-hosted IPs."""
+    last_err: Exception | None = None
+    for wait_until in ("domcontentloaded", "commit"):
+        try:
+            page.goto(url, wait_until=wait_until, timeout=timeout)
+            return
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            if "ERR_HTTP2_PROTOCOL_ERROR" not in msg and "ERR_CONNECTION_RESET" not in msg:
+                raise
+            _log_step(f"Navigation failed ({wait_until}): {msg.splitlines()[0][:180]}")
+    if last_err is not None:
+        raise last_err
+
+
 def _warmup_etrade_origin(page, auth_url: str) -> None:
     """
     Load the OAuth host's origin (e.g. https://us.etrade.com/) before the authorize URL so the
@@ -229,10 +246,10 @@ def _warmup_etrade_origin(page, auth_url: str) -> None:
         if not parsed.scheme or not parsed.netloc or "etrade" not in parsed.netloc.lower():
             return
         origin = f"{parsed.scheme}://{parsed.netloc}/"
-        page.goto(origin, wait_until="domcontentloaded", timeout=60000)
+        _goto_resilient(page, origin, timeout=60000)
         page.wait_for_timeout(random.randint(2000, 3800) if _human_delays_enabled() else 2500)
-    except Exception:
-        pass
+    except Exception as e:
+        _log_step(f"Origin warmup skipped ({e})")
 
 
 def _login_roots(page):
@@ -427,11 +444,16 @@ def _obtain_tokens() -> dict:
                 "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
             )
 
+    # GitHub-hosted runners often get net::ERR_HTTP2_PROTOCOL_ERROR on us.etrade.com
+    # (CDN/WAF vs Chromium HTTP/2). OAuth request_token still works; only the browser
+    # navigation breaks. Force HTTP/1.1.
     _launch_args = [
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--window-size=1920,1080",
+        "--disable-http2",
+        "--disable-quic",
     ]
 
     _log_step(f"Launching Playwright Chromium (headless={headless})")
@@ -458,7 +480,7 @@ def _obtain_tokens() -> dict:
         page = context.new_page()
         _log_step("Warming E*Trade origin and opening authorize URL")
         _warmup_etrade_origin(page, auth_url)
-        page.goto(auth_url, wait_until="domcontentloaded", timeout=90000)
+        _goto_resilient(page, auth_url, timeout=90000)
         page.wait_for_timeout(random.randint(2200, 4200) if _human_delays_enabled() else 3000)
 
         # ── Login (same frame for user+pass; VIP = check "Use security code" + TOTP before Log on)
