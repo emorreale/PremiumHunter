@@ -336,9 +336,20 @@ def _fill_first_visible(root, selectors: tuple[str, ...], value: str) -> bool:
         try:
             loc.wait_for(state="visible", timeout=vis_ms)
             _human_pause(root)
-            loc.fill(value, timeout=5000)
+            loc.click(timeout=5000)
+            loc.fill("", timeout=5000)
+            # E*Trade's Angular form ignores Playwright fill(); keystrokes register.
+            loc.press_sequentially(value, delay=35)
+            try:
+                loc.dispatch_event("input")
+                loc.dispatch_event("change")
+                loc.dispatch_event("blur")
+            except Exception:
+                pass
             return True
         except PlaywrightTimeout:
+            continue
+        except Exception:
             continue
     return False
 
@@ -419,6 +430,9 @@ def _try_login_one_root(
         import pyotp
 
         _fill_first_visible(root, otp_selectors, pyotp.TOTP(totp_secret.strip()).now())
+    if (os.environ.get("PLAYWRIGHT_HEADLESS", "true").strip().lower() in ("0", "false", "no")):
+        # Headed local run: let you click Log on (auto-click submits empty Angular state).
+        return True
     return _click_first_visible(root, logon_selectors)
 
 
@@ -467,6 +481,42 @@ def _print_login_diagnostics(page, totp_secret: str) -> None:
                     print(f"On-page text ({sel}): {t[:900]}", file=sys.stderr)
         except Exception:
             continue
+
+
+def _obtain_tokens_manual() -> dict:
+    """Open the authorize URL in your real browser; you log in; paste the verifier PIN."""
+    import webbrowser
+
+    import pyetrade
+
+    consumer_key = os.environ["ETRADE_CONSUMER_KEY"]
+    consumer_secret = os.environ["ETRADE_CONSUMER_SECRET"]
+    is_sandbox = os.environ.get("ETRADE_SANDBOX", "true").lower() == "true"
+
+    _log_step("Requesting OAuth request token")
+    oauth = pyetrade.ETradeOAuth(consumer_key, consumer_secret)
+    auth_url = oauth.get_request_token()
+    print(f"Authorization URL obtained (sandbox={is_sandbox})")
+    print()
+    print("E*Trade blocks automated Chrome (Playwright). Log in with your normal browser:")
+    print()
+    print(auth_url)
+    print()
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+    print("1. Log in on that page (User ID, password, 2FA as usual).")
+    print("2. Accept / authorize the app if asked.")
+    print("3. Copy the verification code (PIN) shown at the end.")
+    print()
+    verifier = input("Paste the verification code here, then press Enter: ").strip()
+    if not verifier:
+        raise SystemExit("No verification code entered.")
+    _log_step("Exchanging verifier for access tokens")
+    tokens = oauth.get_access_token(verifier)
+    print("Access tokens obtained successfully.")
+    return tokens
 
 
 def _obtain_tokens() -> dict:
@@ -611,23 +661,46 @@ def _obtain_tokens() -> dict:
             )
 
         prev_url = page.url
-        _log_step("Login submitted; waiting to leave /etx/pxy/login")
+        headed = os.environ.get("PLAYWRIGHT_HEADLESS", "true").strip().lower() in (
+            "0",
+            "false",
+            "no",
+        )
+        if headed:
+            _log_step(
+                "User ID / password should be filled. Click Log on in the window "
+                "(complete 2FA if asked). Waiting up to 5 minutes…"
+            )
+            print(
+                "Chromium is open — click Log on yourself. This window waits for the "
+                "authorize / verifier page.",
+                flush=True,
+            )
+            wait_s = 300.0
+        else:
+            _log_step("Login submitted; waiting to leave /etx/pxy/login")
+            wait_s = 37.0
 
         def _wait_off_login_screen(timeout_s: float) -> None:
             deadline = time.time() + timeout_s
             while time.time() < deadline:
                 if "/etx/pxy/login" not in page.url:
                     return
+                if _verifier_from_url(page.url):
+                    return
                 page.wait_for_timeout(400)
 
-        _wait_off_login_screen(12.0)
-        if "/etx/pxy/login" in page.url:
-            try:
-                page.keyboard.press("Enter")
-            except Exception:
-                pass
-            page.wait_for_timeout(1500)
-            _wait_off_login_screen(25.0)
+        if not headed:
+            _wait_off_login_screen(12.0)
+            if "/etx/pxy/login" in page.url:
+                try:
+                    page.keyboard.press("Enter")
+                except Exception:
+                    pass
+                page.wait_for_timeout(1500)
+                _wait_off_login_screen(25.0)
+        else:
+            _wait_off_login_screen(wait_s)
 
         page.wait_for_load_state("domcontentloaded")
         page.wait_for_timeout(2000)
@@ -813,12 +886,14 @@ def main() -> int:
             )
             return 1
 
-        for key in ("ETRADE_USERNAME", "ETRADE_PASSWORD"):
-            if not os.environ.get(key):
-                print(f"{key} is required for browser login", file=sys.stderr)
-                return 1
-
-        tokens = _obtain_tokens()
+        if _force_browser():
+            for key in ("ETRADE_USERNAME", "ETRADE_PASSWORD"):
+                if not os.environ.get(key):
+                    print(f"{key} is required for Playwright login", file=sys.stderr)
+                    return 1
+            tokens = _obtain_tokens()
+        else:
+            tokens = _obtain_tokens_manual()
         sid = _upsert_session(conn, tokens["oauth_token"], tokens["oauth_token_secret"])
         print(f"Tokens written to etrade_sessions (session_id={sid}).")
 
