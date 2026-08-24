@@ -657,6 +657,13 @@ def main() -> int:
             print(f"  {sym}: committed rows so far: {total_rows}")
 
     print(f"Done. Inserted {total_rows} options_scans row(s) for {', '.join(symbols)}.")
+    if total_rows == 0:
+        print(
+            "No options_scans rows inserted. Tokens may be expired — "
+            "run python scripts/etrade_token_refresh.py locally, then re-run this workflow.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

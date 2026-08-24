@@ -35,8 +35,9 @@ Optional:
                             multiplied by iframe count × selector count)
   ETRADE_FRAMES_FIRST      — set "1" to try child iframes before the main document (legacy order)
 
-GitHub Actions often cannot complete login if E*Trade shows CAPTCHA or blocks datacenter IPs;
-use workflow_dispatch from a trusted network or refresh tokens from your machine if needed.
+GitHub-hosted runners cannot load us.etrade.com (WAF / datacenter IP). CI should
+renew existing tokens via the OAuth API (after 6:00 PM ET). Full Playwright login
+is for your machine:  python scripts/etrade_token_refresh.py
 """
 from __future__ import annotations
 
@@ -200,6 +201,55 @@ def _upsert_session(conn, token: str, secret: str) -> int:
     return sid
 
 
+def _load_latest_tokens(conn) -> tuple[str, str] | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT access_token, access_token_secret
+            FROM etrade_sessions
+            ORDER BY last_renewed DESC NULLS LAST
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+    if not row or not row[0] or not row[1]:
+        return None
+    return str(row[0]), str(row[1])
+
+
+def _renew_tokens_via_api(token: str, secret: str) -> bool:
+    """E*Trade renew_access_token (no browser). Allowed after ~6:00 PM ET; fails if expired."""
+    from pyetrade.authorization import ETradeAccessManager
+
+    consumer_key = os.environ["ETRADE_CONSUMER_KEY"]
+    consumer_secret = os.environ["ETRADE_CONSUMER_SECRET"]
+    mgr = ETradeAccessManager(consumer_key, consumer_secret, token, secret)
+    mgr.renew_access_token()
+    return True
+
+
+def _in_github_actions() -> bool:
+    return (os.environ.get("GITHUB_ACTIONS") or "").strip().lower() == "true"
+
+
+def _force_browser() -> bool:
+    return (os.environ.get("ETRADE_FORCE_BROWSER") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _renew_only() -> bool:
+    if "--renew-only" in sys.argv:
+        return True
+    return (os.environ.get("ETRADE_RENEW_ONLY") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def _verifier_from_url(url: str) -> str | None:
     """Callback-style redirect includes oauth_verifier=…"""
     from urllib.parse import parse_qs, unquote, urlparse
@@ -225,7 +275,12 @@ def _goto_resilient(page, url: str, *, timeout: int = 90000) -> None:
         except Exception as e:
             last_err = e
             msg = str(e)
-            if "ERR_HTTP2_PROTOCOL_ERROR" not in msg and "ERR_CONNECTION_RESET" not in msg:
+            retryable = (
+                "ERR_HTTP2_PROTOCOL_ERROR" in msg
+                or "ERR_CONNECTION_RESET" in msg
+                or "Timeout" in type(e).__name__
+            )
+            if not retryable:
                 raise
             _log_step(f"Navigation failed ({wait_until}): {msg.splitlines()[0][:180]}")
     if last_err is not None:
@@ -239,7 +294,12 @@ def _warmup_etrade_origin(page, auth_url: str) -> None:
     """
     from urllib.parse import urlparse
 
-    if (os.environ.get("ETRADE_SKIP_COOKIE_WARMUP") or "").strip().lower() in ("1", "true", "yes"):
+    skip = (os.environ.get("ETRADE_SKIP_COOKIE_WARMUP") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if skip or _in_github_actions():
         return
     try:
         parsed = urlparse(auth_url)
@@ -702,23 +762,64 @@ def main() -> int:
         print("DATABASE_URL is required", file=sys.stderr)
         return 1
 
-    for key in ("ETRADE_CONSUMER_KEY", "ETRADE_CONSUMER_SECRET", "ETRADE_USERNAME", "ETRADE_PASSWORD"):
+    for key in ("ETRADE_CONSUMER_KEY", "ETRADE_CONSUMER_SECRET"):
         if not os.environ.get(key):
             print(f"{key} is required", file=sys.stderr)
             return 1
 
     import psycopg
 
-    _log_step("Starting token refresh run")
-    tokens = _obtain_tokens()
-    tok = tokens["oauth_token"]
-    sec = tokens["oauth_token_secret"]
-
     dsn = _prepare_psycopg_dsn(database_url)
-    _log_step("Writing refreshed tokens to Postgres")
+    renew_only = _renew_only()
+    _log_step("Starting token refresh run")
+
     with psycopg.connect(dsn) as conn:
         _ensure_sessions_table(conn)
-        sid = _upsert_session(conn, tok, sec)
+        existing = _load_latest_tokens(conn)
+        if existing:
+            tok, sec = existing
+            _log_step("Attempting API token renew (no browser)")
+            try:
+                _renew_tokens_via_api(tok, sec)
+            except Exception as e:
+                _log_step(f"API renew failed: {e}")
+            else:
+                sid = _upsert_session(conn, tok, sec)
+                print(f"Tokens renewed via API (session_id={sid}).")
+                return 0
+
+        if renew_only:
+            print(
+                "API renew failed and ETRADE_RENEW_ONLY is set. "
+                "Run Playwright login locally: python scripts/etrade_token_refresh.py",
+                file=sys.stderr,
+            )
+            return 1
+
+        if _in_github_actions() and not _force_browser():
+            if existing:
+                print(
+                    "GitHub-hosted runners cannot load us.etrade.com (login page times out). "
+                    "Existing DB tokens were left in place. If scans insert 0 rows, run this "
+                    "script on your PC to mint new tokens, then keep them alive with the "
+                    "evening API-renew cron (after 6:00 PM ET).",
+                    file=sys.stderr,
+                )
+                return 0
+            print(
+                "No etrade_sessions tokens and GitHub Actions cannot complete E*Trade login. "
+                "On your machine: python scripts/etrade_token_refresh.py",
+                file=sys.stderr,
+            )
+            return 1
+
+        for key in ("ETRADE_USERNAME", "ETRADE_PASSWORD"):
+            if not os.environ.get(key):
+                print(f"{key} is required for browser login", file=sys.stderr)
+                return 1
+
+        tokens = _obtain_tokens()
+        sid = _upsert_session(conn, tokens["oauth_token"], tokens["oauth_token_secret"])
         print(f"Tokens written to etrade_sessions (session_id={sid}).")
 
     return 0
