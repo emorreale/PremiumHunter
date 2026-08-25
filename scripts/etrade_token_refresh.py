@@ -217,6 +217,98 @@ def _load_latest_tokens(conn) -> tuple[str, str] | None:
     return str(row[0]), str(row[1])
 
 
+def _save_pending_request(conn, request_token: str, request_secret: str, authorize_url: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO etrade_oauth_pending
+                (id, request_token, request_token_secret, authorize_url, created_at)
+            VALUES (
+                1, %s, %s, %s,
+                (date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                request_token = EXCLUDED.request_token,
+                request_token_secret = EXCLUDED.request_token_secret,
+                authorize_url = EXCLUDED.authorize_url,
+                created_at = EXCLUDED.created_at
+            """,
+            (request_token, request_secret, authorize_url),
+        )
+    conn.commit()
+
+
+def _load_pending_request(conn) -> tuple[str, str] | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT request_token, request_token_secret
+            FROM etrade_oauth_pending
+            WHERE id = 1
+            """
+        )
+        row = cur.fetchone()
+    if not row or not row[0] or not row[1]:
+        return None
+    return str(row[0]), str(row[1])
+
+
+def _clear_pending_request(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM etrade_oauth_pending WHERE id = 1")
+    conn.commit()
+
+
+def _request_token_pair(oauth) -> tuple[str, str]:
+    session = oauth.session
+    token = getattr(session, "token", None) or {}
+    key = token.get("oauth_token") if isinstance(token, dict) else None
+    secret = token.get("oauth_token_secret") if isinstance(token, dict) else None
+    if not key:
+        key = getattr(session, "_client", None) and session._client.client.resource_owner_key
+    if not secret:
+        secret = getattr(session, "_client", None) and session._client.client.resource_owner_secret
+    if not key or not secret:
+        raise RuntimeError("Could not read OAuth request token from pyetrade session")
+    return str(key), str(secret)
+
+
+def _exchange_verifier(request_token: str, request_secret: str, verifier: str) -> dict:
+    from requests_oauthlib import OAuth1Session
+
+    consumer_key = os.environ["ETRADE_CONSUMER_KEY"]
+    consumer_secret = os.environ["ETRADE_CONSUMER_SECRET"]
+    session = OAuth1Session(
+        consumer_key,
+        client_secret=consumer_secret,
+        resource_owner_key=request_token,
+        resource_owner_secret=request_secret,
+        verifier=verifier,
+    )
+    tokens = session.fetch_access_token("https://api.etrade.com/oauth/access_token")
+    tok = tokens.get("oauth_token")
+    sec = tokens.get("oauth_token_secret")
+    if not tok or not sec:
+        raise RuntimeError(f"Access token response missing fields: {list(tokens)}")
+    return {"oauth_token": tok, "oauth_token_secret": sec}
+
+
+def _emit_authorize_url(auth_url: str) -> None:
+    print(auth_url, flush=True)
+    summary = (os.environ.get("GITHUB_STEP_SUMMARY") or "").strip()
+    if not summary:
+        return
+    with open(summary, "a", encoding="utf-8") as fh:
+        fh.write("## E*Trade login URL\n\n")
+        fh.write("1. Open this link **on your computer** (Chrome/Edge — not a GitHub server).\n\n")
+        fh.write(f"{auth_url}\n\n")
+        fh.write("2. Log in and copy the verification PIN.\n\n")
+        fh.write(
+            "3. GitHub → Actions → **Mint E*Trade token** → Run workflow. "
+            "Paste the PIN into **verifier**. Do this within a few minutes.\n"
+        )
+
+
 def _renew_tokens_via_api(token: str, secret: str) -> bool:
     """E*Trade renew_access_token (no browser). Allowed after ~6:00 PM ET; fails if expired."""
     from pyetrade.authorization import ETradeAccessManager
@@ -829,6 +921,24 @@ def _obtain_tokens() -> dict:
     return tokens
 
 
+def _cli_verifier() -> str:
+    if "--verifier" in sys.argv:
+        i = sys.argv.index("--verifier")
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1].strip()
+    return (os.environ.get("ETRADE_VERIFIER") or "").strip()
+
+
+def _start_login() -> bool:
+    if "--start-login" in sys.argv:
+        return True
+    return (os.environ.get("ETRADE_START_LOGIN") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def main() -> int:
     database_url = (os.environ.get("DATABASE_URL") or "").strip()
     if not database_url:
@@ -840,14 +950,50 @@ def main() -> int:
             print(f"{key} is required", file=sys.stderr)
             return 1
 
+    import pyetrade
     import psycopg
 
     dsn = _prepare_psycopg_dsn(database_url)
     renew_only = _renew_only()
+    verifier = _cli_verifier()
+    start_login = _start_login()
     _log_step("Starting token refresh run")
 
     with psycopg.connect(dsn) as conn:
         _ensure_sessions_table(conn)
+
+        if verifier:
+            pending = _load_pending_request(conn)
+            if not pending:
+                print(
+                    "No pending login. Run Mint E*Trade token first with verifier left empty.",
+                    file=sys.stderr,
+                )
+                return 1
+            _log_step("Exchanging verification PIN for access tokens")
+            try:
+                tokens = _exchange_verifier(pending[0], pending[1], verifier)
+            except Exception as e:
+                print(f"PIN exchange failed: {e}", file=sys.stderr)
+                return 1
+            sid = _upsert_session(conn, tokens["oauth_token"], tokens["oauth_token_secret"])
+            _clear_pending_request(conn)
+            print(f"Tokens written to etrade_sessions (session_id={sid}).")
+            return 0
+
+        if start_login:
+            _log_step("Requesting OAuth request token")
+            oauth = pyetrade.ETradeOAuth(
+                os.environ["ETRADE_CONSUMER_KEY"],
+                os.environ["ETRADE_CONSUMER_SECRET"],
+            )
+            auth_url = oauth.get_request_token()
+            req_tok, req_sec = _request_token_pair(oauth)
+            _save_pending_request(conn, req_tok, req_sec, auth_url)
+            print("Authorization URL obtained. Open it in your browser, then re-run with the PIN.")
+            _emit_authorize_url(auth_url)
+            return 0
+
         existing = _load_latest_tokens(conn)
         if existing:
             tok, sec = existing
@@ -864,7 +1010,7 @@ def main() -> int:
         if renew_only:
             print(
                 "API renew failed and ETRADE_RENEW_ONLY is set. "
-                "Run Playwright login locally: python scripts/etrade_token_refresh.py",
+                "Run the Mint E*Trade token workflow (or this script locally).",
                 file=sys.stderr,
             )
             return 1
@@ -872,16 +1018,13 @@ def main() -> int:
         if _in_github_actions() and not _force_browser():
             if existing:
                 print(
-                    "GitHub-hosted runners cannot load us.etrade.com (login page times out). "
-                    "Existing DB tokens were left in place. If scans insert 0 rows, run this "
-                    "script on your PC to mint new tokens, then keep them alive with the "
-                    "evening API-renew cron (after 6:00 PM ET).",
+                    "GitHub-hosted runners cannot complete E*Trade login. "
+                    "Use Actions → Mint E*Trade token (URL then PIN).",
                     file=sys.stderr,
                 )
                 return 0
             print(
-                "No etrade_sessions tokens and GitHub Actions cannot complete E*Trade login. "
-                "On your machine: python scripts/etrade_token_refresh.py",
+                "No etrade_sessions tokens. Use Actions → Mint E*Trade token.",
                 file=sys.stderr,
             )
             return 1

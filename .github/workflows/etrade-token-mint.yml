@@ -1,0 +1,55 @@
+# Two-step mint: GitHub cannot open E*Trade's login page.
+# 1. Run with verifier empty → job summary has a login URL (open in your browser).
+# 2. Log in, copy the PIN, Run again and paste it into verifier (within a few minutes).
+#
+# Required secrets: DATABASE_URL, ETRADE_CONSUMER_KEY, ETRADE_CONSUMER_SECRET
+# Optional: DATABASE_IPV4
+name: Mint E*Trade token
+
+on:
+  workflow_dispatch:
+    inputs:
+      verifier:
+        description: "Leave empty first (get login URL). Second run: paste the E*Trade PIN."
+        required: false
+        type: string
+
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements-ci.txt
+
+      - name: Start login (write authorize URL)
+        if: ${{ inputs.verifier == '' }}
+        env:
+          DATABASE_FORCE_IPV4: "1"
+          DATABASE_IPV4: ${{ secrets.DATABASE_IPV4 }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ETRADE_CONSUMER_KEY: ${{ secrets.ETRADE_CONSUMER_KEY }}
+          ETRADE_CONSUMER_SECRET: ${{ secrets.ETRADE_CONSUMER_SECRET }}
+          ETRADE_START_LOGIN: "1"
+        run: python scripts/etrade_token_refresh.py --start-login
+
+      - name: Exchange PIN for access tokens
+        if: ${{ inputs.verifier != '' }}
+        env:
+          DATABASE_FORCE_IPV4: "1"
+          DATABASE_IPV4: ${{ secrets.DATABASE_IPV4 }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ETRADE_CONSUMER_KEY: ${{ secrets.ETRADE_CONSUMER_KEY }}
+          ETRADE_CONSUMER_SECRET: ${{ secrets.ETRADE_CONSUMER_SECRET }}
+          ETRADE_VERIFIER: ${{ inputs.verifier }}
+        run: python scripts/etrade_token_refresh.py
