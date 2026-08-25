@@ -43,6 +43,50 @@ def save_persisted_tokens(tokens: dict) -> None:
     _TOKEN_PATH.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def upsert_tokens_to_postgres(tokens: dict) -> int | None:
+    """Write access tokens to etrade_sessions so GitHub scans can use them. None if no DATABASE_URL."""
+    database_url = (os.getenv("DATABASE_URL") or "").strip()
+    if not database_url:
+        return None
+    try:
+        import psycopg
+    except ImportError:
+        return None
+
+    tok = tokens["oauth_token"]
+    sec = tokens["oauth_token_secret"]
+    ts = "(date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)"
+    dsn = _prepare_psycopg_dsn(database_url)
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT session_id FROM etrade_sessions
+                WHERE access_token = %s AND access_token_secret = %s
+                ORDER BY last_renewed DESC LIMIT 1
+                """,
+                (tok, sec),
+            )
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    f"UPDATE etrade_sessions SET last_renewed = {ts} WHERE session_id = %s",
+                    (row[0],),
+                )
+                conn.commit()
+                return row[0]
+            cur.execute(
+                f"""
+                INSERT INTO etrade_sessions (access_token, access_token_secret, last_renewed)
+                VALUES (%s, %s, {ts}) RETURNING session_id
+                """,
+                (tok, sec),
+            )
+            sid = cur.fetchone()[0]
+        conn.commit()
+    return sid
+
+
 def clear_persisted_tokens() -> None:
     _TOKEN_PATH.unlink(missing_ok=True)
 

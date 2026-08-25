@@ -88,15 +88,6 @@ ALTER TABLE options_scans ADD COLUMN IF NOT EXISTS scan_type VARCHAR(16);
 
 CREATE INDEX IF NOT EXISTS idx_options_scans_scan_type ON options_scans (scan_type);
 
--- Pending OAuth request token for GitHub "mint" workflow (step 1 URL, step 2 PIN).
-CREATE TABLE IF NOT EXISTS etrade_oauth_pending (
-    id                    INTEGER PRIMARY KEY CHECK (id = 1),
-    request_token         TEXT NOT NULL,
-    request_token_secret  TEXT NOT NULL,
-    authorize_url         TEXT,
-    created_at            TIMESTAMP(0) DEFAULT (date_trunc('second', timezone('America/Chicago', now())))::timestamp(0)
-);
-
 DO $$
 BEGIN
     IF NOT EXISTS (

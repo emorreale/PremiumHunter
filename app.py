@@ -39,6 +39,7 @@ from etrade_auth import (
     get_oauth,
     load_persisted_tokens,
     save_persisted_tokens,
+    upsert_tokens_to_postgres,
 )
 from etrade_market import create_market_session, probe_etrade_tokens
 from ph_auth_gate import require_login
@@ -555,6 +556,21 @@ with st.sidebar:
                 try:
                     tokens = get_access_tokens(st.session_state.oauth, verifier)
                     save_persisted_tokens(tokens)
+                    try:
+                        sid = upsert_tokens_to_postgres(tokens)
+                        if sid is not None:
+                            _ETRADE_LOG.info(
+                                "E*Trade Connect: wrote tokens to Postgres (session_id=%s)",
+                                sid,
+                            )
+                    except Exception as e:
+                        _ETRADE_LOG.error(
+                            "E*Trade Connect: Postgres token save failed — %s", e
+                        )
+                        st.warning(
+                            "Logged in here, but GitHub scans will not see this token "
+                            "(could not write to the database)."
+                        )
                     st.session_state.tokens = tokens
                     st.session_state.market = create_market_session(tokens)
                     st.session_state.oauth = None
