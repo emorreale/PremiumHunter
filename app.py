@@ -563,6 +563,15 @@ with st.sidebar:
                                 "E*Trade Connect: wrote tokens to Postgres (session_id=%s)",
                                 sid,
                             )
+                        else:
+                            _ETRADE_LOG.error(
+                                "E*Trade Connect: Postgres token save skipped "
+                                "(DATABASE_URL missing or psycopg not installed)"
+                            )
+                            st.warning(
+                                "Logged in here, but GitHub scans will not see this token "
+                                "(database URL is missing in this app environment)."
+                            )
                     except Exception as e:
                         _ETRADE_LOG.error(
                             "E*Trade Connect: Postgres token save failed — %s", e
