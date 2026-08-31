@@ -22,10 +22,8 @@
 #
 # OAuth:
 #   GitHub-hosted IPs cannot load us.etrade.com, so Playwright login is not used in CI.
-#   After 6:00 PM ET, E*Trade allows renew_access_token (no browser). A 5:05 PM CT cron
-#   does that daily (including weekends) so Monday morning tokens are still valid.
-#   First-time / expired tokens: run  python scripts/etrade_token_refresh.py  on your PC.
-#   7:30 CT still calls the refresh script; it tries API renew and otherwise leaves DB tokens.
+#   7:30 CT weekdays calls the refresh script (API renew if possible; otherwise leaves DB tokens).
+#   Mint a new token in the Streamlit app after midnight ET.
 #
 # Note: 8:00 and 12:00 CT each have their own cron entry so the universe-scan job can detect them
 # via github.event.schedule (the every-30-min entries deliberately skip those minutes to avoid a
@@ -59,9 +57,6 @@ on:
     # 15:00 CT = last watchlist scan only
     - cron: "0 15 * * 1-5"
       timezone: "America/Chicago"
-    # 17:05 CT = 18:05 ET — API token renew only (E*Trade allows renew after 18:00 ET)
-    - cron: "5 17 * * *"
-      timezone: "America/Chicago"
 
 jobs:
   # ─── Watchlist scan (every 30 min during market hours) ───────────────────────
@@ -84,10 +79,7 @@ jobs:
         run: pip install -r requirements-ci.txt
 
       - name: Refresh E*Trade OAuth tokens
-        if: >-
-          github.event_name == 'workflow_dispatch' ||
-          github.event.schedule == '30 7 * * 1-5' ||
-          github.event.schedule == '5 17 * * *'
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 7 * * 1-5'
         env:
           DATABASE_FORCE_IPV4: "1"
           DATABASE_IPV4: ${{ secrets.DATABASE_IPV4 }}
@@ -98,7 +90,6 @@ jobs:
           ETRADE_PASSWORD: ${{ secrets.ETRADE_PASSWORD }}
           ETRADE_TOTP_SECRET: ${{ secrets.ETRADE_TOTP_SECRET }}
           ETRADE_SANDBOX: ${{ secrets.ETRADE_SANDBOX }}
-          ETRADE_RENEW_ONLY: ${{ github.event.schedule == '5 17 * * *' && '1' || '0' }}
         run: python scripts/etrade_token_refresh.py
 
       - name: Upload E*Trade login debug screenshot
@@ -110,7 +101,6 @@ jobs:
           if-no-files-found: ignore
 
       - name: Run watchlist scan + Wheel Alpha
-        if: github.event.schedule != '5 17 * * *'
         env:
           DATABASE_FORCE_IPV4: "1"
           DATABASE_IPV4: ${{ secrets.DATABASE_IPV4 }}
